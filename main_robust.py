@@ -27,14 +27,15 @@ warnings.filterwarnings('ignore')
 # 🛡️ 무작위 80% 샘플링 견고성에 특화된 설정
 CFG = {
     'NBITS': 2048,
-    'SEEDS': [42, 123, 456, 789, 999, 2023, 2024, 777, 888],  # 🔥 9개 시드로 극대 다양성
-    'N_SPLITS': 20,        # 더 많은 분할로 모든 케이스 커버
-    'N_REPEATS': 3,        # 반복 교차검증
-    'BOOTSTRAP_SAMPLES': 50,  # 🔥 Bootstrap 샘플링으로 견고성 극대화
-    'CONSENSUS_THRESHOLD': 0.7,  # 합의 기반 예측
-    'UNCERTAINTY_WEIGHT': 0.3,   # 불확실성 가중치
-    'DIVERSITY_PENALTY': 0.1,    # 다양성 페널티
-    'ROBUST_LOSS': True,         # 견고한 손실함수 사용
+    'SEEDS': [42, 123, 456, 789, 999],  # 5개 시드로 균형
+    'N_SPLITS': 10,        # 최적화 시 빠른 실행
+    'N_REPEATS': 2,        # 반복 교차검증
+    'OPTIMIZATION_TRIALS': 100,  # 🔥 Optuna 최적화 시행 수
+    'ENSEMBLE_TRIALS': 200,      # 앙상블 시 더 많은 시행
+    'ENABLE_OPTIMIZATION': True,  # 🎯 Optuna 최적화 활성화
+    'OPTIMIZATION_TIMEOUT': 3600,  # 1시간 최적화 타임아웃
+    'RANDOM_SAMPLING_WEIGHT': 0.8,  # 무작위 샘플링 가중치
+    'STABILITY_WEIGHT': 0.2,         # 안정성 가중치
 }
 
 def seed_everything(seed):
@@ -42,12 +43,12 @@ def seed_everything(seed):
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
 
-class UltraRobustPredictor:
+class OptimizedRobustPredictor:
     def __init__(self):
         self.models = {}
         self.scalers = {}
         self.imputer = SimpleImputer(strategy='median')
-        self.uncertainty_models = []
+        self.optimized_params = {}
         
     def get_core_descriptors(self, mol):
         """핵심 분자 설명자"""
@@ -79,7 +80,7 @@ class UltraRobustPredictor:
             return None
 
         try:
-            # 1. Multiple Morgan Fingerprints (다양한 반지름으로 견고성 확보)
+            # 1. Multiple Morgan Fingerprints
             morgan_features = []
             for radius in [1, 2, 3]:
                 fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=CFG['NBITS'])
@@ -176,13 +177,12 @@ class UltraRobustPredictor:
         score = 0.5 * (1 - A) + 0.5 * B
         return score, A, B, correlation
 
-    def simulate_random_80_percent(self, y_true, y_pred, n_simulations=1000):
-        """🎯 무작위 80% 샘플링 시뮬레이션"""
+    def simulate_random_80_percent_cv(self, y_true, y_pred, n_simulations=100):
+        """🎯 교차검증용 빠른 무작위 80% 샘플링 시뮬레이션"""
         scores = []
         indices = np.arange(len(y_true))
         
         for _ in range(n_simulations):
-            # 무작위 80% 선택
             sample_size = int(len(indices) * 0.8)
             random_indices = np.random.choice(indices, size=sample_size, replace=False)
             
@@ -192,210 +192,360 @@ class UltraRobustPredictor:
             score, _, _, _ = self.get_leaderboard_score(y_true_sample, y_pred_sample)
             scores.append(score)
         
-        return {
-            'mean': np.mean(scores),
-            'std': np.std(scores),
-            'min': np.min(scores),
-            'max': np.max(scores),
-            'q25': np.percentile(scores, 25),
-            'q75': np.percentile(scores, 75)
+        return np.mean(scores), np.std(scores)
+
+    def objective_lgb(self, trial, X, y):
+        """🔥 LightGBM 무작위 80% 샘플링 최적화 목적함수"""
+        params = {
+            'objective': 'regression',
+            'metric': 'rmse',
+            'verbose': -1,
+            'n_jobs': -1,
+            'seed': trial.suggest_categorical('seed', CFG['SEEDS']),
+            'boosting_type': 'gbdt',
+            'n_estimators': trial.suggest_int('n_estimators', 1000, 4000),
+            'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.05, log=True),
+            'num_leaves': trial.suggest_int('num_leaves', 8, 40),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'feature_fraction': trial.suggest_float('feature_fraction', 0.4, 0.9),
+            'bagging_fraction': trial.suggest_float('bagging_fraction', 0.4, 0.9),
+            'bagging_freq': trial.suggest_int('bagging_freq', 1, 10),
+            'min_child_samples': trial.suggest_int('min_child_samples', 10, 100),
+            'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 10.0, log=True),
+            'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 10.0, log=True),
+            'min_split_gain': trial.suggest_float('min_split_gain', 1e-8, 1.0, log=True),
         }
 
-    def robust_ensemble_predict(self, models, X_test, uncertainty_weight=0.3):
-        """🛡️ 불확실성을 고려한 견고한 앙상블 예측"""
-        predictions = []
-        uncertainties = []
+        # 🎯 무작위 80% 샘플링 견고성 평가
+        cv_scores = []
+        random_sampling_scores = []
         
-        for model_group in models:
-            group_preds = []
-            for model in model_group:
-                pred = model.predict(X_test)
-                group_preds.append(pred)
-            
-            # 그룹 내 예측 분산 = 불확실성
-            group_preds = np.array(group_preds)
-            group_mean = np.mean(group_preds, axis=0)
-            group_std = np.std(group_preds, axis=0)
-            
-            predictions.append(group_mean)
-            uncertainties.append(group_std)
+        # 다양한 CV 전략으로 견고성 확인
+        cv_strategies = [
+            KFold(n_splits=CFG['N_SPLITS'], shuffle=True, random_state=42),
+            RepeatedKFold(n_splits=5, n_repeats=CFG['N_REPEATS'], random_state=42),
+            ShuffleSplit(n_splits=8, test_size=0.2, random_state=42)
+        ]
         
-        predictions = np.array(predictions)
-        uncertainties = np.array(uncertainties)
-        
-        # 불확실성 가중 평균
-        weights = 1.0 / (uncertainties + 1e-8)
-        weights = weights / np.sum(weights, axis=0)
-        
-        final_pred = np.sum(predictions * weights, axis=0)
-        final_uncertainty = np.mean(uncertainties, axis=0)
-        
-        return final_pred, final_uncertainty
+        for cv_strategy in cv_strategies:
+            for train_idx, val_idx in cv_strategy.split(X, y):
+                X_train, X_val = X[train_idx], X[val_idx]
+                y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
 
-    def train_ultra_robust_ensemble(self, X_train_full, y_train_full, X_test_full):
-        """🛡️ 무작위 80% 샘플링에 최적화된 초견고 앙상블"""
-        print("🛡️ 무작위 80% 샘플링 견고 앙상블 훈련 시작...")
+                scaler = RobustScaler()
+                X_train_scaled = scaler.fit_transform(X_train)
+                X_val_scaled = scaler.transform(X_val)
+
+                model = lgb.LGBMRegressor(**params)
+                model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)],
+                          callbacks=[lgb.early_stopping(200, verbose=False)])
+                
+                y_pred = model.predict(X_val_scaled)
+                
+                # 기본 스코어
+                score, _, _, _ = self.get_leaderboard_score(y_val, y_pred)
+                cv_scores.append(score)
+                
+                # 🎯 무작위 80% 샘플링 시뮬레이션
+                random_mean, random_std = self.simulate_random_80_percent_cv(y_val, y_pred)
+                random_sampling_scores.append(random_mean)
+                
+                # 시간 절약을 위해 일부만 평가
+                if len(cv_scores) >= 10:
+                    break
+            if len(cv_scores) >= 10:
+                break
+
+        # 🛡️ 견고성 점수 계산
+        base_score = np.mean(cv_scores)
+        random_score = np.mean(random_sampling_scores)
+        stability_score = 1.0 / (1.0 + np.std(cv_scores))  # 안정성 점수
         
-        all_models = []
+        # 🎯 최종 목적함수: 무작위 샘플링 성능 + 안정성
+        final_score = (CFG['RANDOM_SAMPLING_WEIGHT'] * random_score + 
+                      CFG['STABILITY_WEIGHT'] * stability_score)
+        
+        return final_score
+
+    def objective_xgb(self, trial, X, y):
+        """🔥 XGBoost 무작위 80% 샘플링 최적화 목적함수"""
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 1000, 4000),
+            'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.05, log=True),
+            'max_depth': trial.suggest_int('max_depth', 3, 10),
+            'subsample': trial.suggest_float('subsample', 0.4, 0.9),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.4, 0.9),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
+            'min_child_weight': trial.suggest_int('min_child_weight', 1, 20),
+            'gamma': trial.suggest_float('gamma', 1e-8, 1.0, log=True),
+            'random_state': trial.suggest_categorical('random_state', CFG['SEEDS']),
+            'n_jobs': -1,
+        }
+
+        cv_scores = []
+        random_sampling_scores = []
+        
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        for train_idx, val_idx in kf.split(X, y):
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+            scaler = RobustScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_val_scaled = scaler.transform(X_val)
+
+            model = xgb.XGBRegressor(**params)
+            try:
+                model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)],
+                         callbacks=[xgb.callback.EarlyStopping(rounds=200)])
+            except:
+                model.fit(X_train_scaled, y_train)
+            
+            y_pred = model.predict(X_val_scaled)
+            
+            score, _, _, _ = self.get_leaderboard_score(y_val, y_pred)
+            cv_scores.append(score)
+            
+            random_mean, _ = self.simulate_random_80_percent_cv(y_val, y_pred)
+            random_sampling_scores.append(random_mean)
+
+        base_score = np.mean(cv_scores)
+        random_score = np.mean(random_sampling_scores)
+        stability_score = 1.0 / (1.0 + np.std(cv_scores))
+        
+        final_score = (CFG['RANDOM_SAMPLING_WEIGHT'] * random_score + 
+                      CFG['STABILITY_WEIGHT'] * stability_score)
+        
+        return final_score
+
+    def objective_rf(self, trial, X, y):
+        """🔥 RandomForest 무작위 80% 샘플링 최적화 목적함수"""
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 200, 1500),
+            'max_depth': trial.suggest_int('max_depth', 5, 20),
+            'min_samples_split': trial.suggest_int('min_samples_split', 5, 50),
+            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 2, 20),
+            'max_features': trial.suggest_float('max_features', 0.4, 1.0),
+            'bootstrap': trial.suggest_categorical('bootstrap', [True, False]),
+            'random_state': trial.suggest_categorical('random_state', CFG['SEEDS']),
+            'n_jobs': -1,
+        }
+
+        cv_scores = []
+        random_sampling_scores = []
+        
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        for train_idx, val_idx in kf.split(X, y):
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+            scaler = RobustScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_val_scaled = scaler.transform(X_val)
+
+            model = RandomForestRegressor(**params)
+            model.fit(X_train_scaled, y_train)
+            
+            y_pred = model.predict(X_val_scaled)
+            
+            score, _, _, _ = self.get_leaderboard_score(y_val, y_pred)
+            cv_scores.append(score)
+            
+            random_mean, _ = self.simulate_random_80_percent_cv(y_val, y_pred)
+            random_sampling_scores.append(random_mean)
+
+        base_score = np.mean(cv_scores)
+        random_score = np.mean(random_sampling_scores)
+        stability_score = 1.0 / (1.0 + np.std(cv_scores))
+        
+        final_score = (CFG['RANDOM_SAMPLING_WEIGHT'] * random_score + 
+                      CFG['STABILITY_WEIGHT'] * stability_score)
+        
+        return final_score
+
+    def optimize_models(self, X_train, y_train):
+        """🔥 다중 모델 Optuna 최적화"""
+        print("🔥 Optuna 하이퍼파라미터 최적화 시작...")
+        
+        optimized_params = {}
+        
+        # 1. LightGBM 최적화
+        print("\n🎯 LightGBM 최적화 중...")
+        study_lgb = optuna.create_study(direction='maximize', 
+                                       sampler=optuna.samplers.TPESampler(seed=42),
+                                       pruner=optuna.pruners.MedianPruner())
+        study_lgb.optimize(lambda trial: self.objective_lgb(trial, X_train, y_train), 
+                          n_trials=CFG['OPTIMIZATION_TRIALS'],
+                          timeout=CFG['OPTIMIZATION_TIMEOUT']//3)
+        
+        optimized_params['lgb'] = study_lgb.best_params
+        print(f"✅ LightGBM 최적화 완료 - 최고 스코어: {study_lgb.best_value:.4f}")
+        print(f"최적 파라미터: {study_lgb.best_params}")
+        
+        # 2. XGBoost 최적화
+        print("\n🎯 XGBoost 최적화 중...")
+        study_xgb = optuna.create_study(direction='maximize', 
+                                       sampler=optuna.samplers.TPESampler(seed=123),
+                                       pruner=optuna.pruners.MedianPruner())
+        study_xgb.optimize(lambda trial: self.objective_xgb(trial, X_train, y_train), 
+                          n_trials=CFG['OPTIMIZATION_TRIALS'],
+                          timeout=CFG['OPTIMIZATION_TIMEOUT']//3)
+        
+        optimized_params['xgb'] = study_xgb.best_params
+        print(f"✅ XGBoost 최적화 완료 - 최고 스코어: {study_xgb.best_value:.4f}")
+        print(f"최적 파라미터: {study_xgb.best_params}")
+        
+        # 3. RandomForest 최적화
+        print("\n🎯 RandomForest 최적화 중...")
+        study_rf = optuna.create_study(direction='maximize', 
+                                      sampler=optuna.samplers.TPESampler(seed=456),
+                                      pruner=optuna.pruners.MedianPruner())
+        study_rf.optimize(lambda trial: self.objective_rf(trial, X_train, y_train), 
+                         n_trials=CFG['OPTIMIZATION_TRIALS'],
+                         timeout=CFG['OPTIMIZATION_TIMEOUT']//3)
+        
+        optimized_params['rf'] = study_rf.best_params
+        print(f"✅ RandomForest 최적화 완료 - 최고 스코어: {study_rf.best_value:.4f}")
+        print(f"최적 파라미터: {study_rf.best_params}")
+        
+        self.optimized_params = optimized_params
+        
+        # 최적화 결과 저장
+        with open('optimized_params.pkl', 'wb') as f:
+            pickle.dump(optimized_params, f)
+        print("\n💾 최적화된 파라미터가 'optimized_params.pkl'에 저장되었습니다.")
+        
+        return optimized_params
+
+    def train_optimized_ensemble(self, X_train_full, y_train_full, X_test_full):
+        """🎯 최적화된 파라미터로 견고한 앙상블 훈련"""
+        print("🎯 최적화된 파라미터로 견고한 앙상블 훈련 시작...")
+        
+        if CFG['ENABLE_OPTIMIZATION']:
+            # Optuna 최적화 실행
+            optimized_params = self.optimize_models(X_train_full, y_train_full)
+        else:
+            # 저장된 파라미터 로드
+            try:
+                with open('optimized_params.pkl', 'rb') as f:
+                    optimized_params = pickle.load(f)
+                print("💾 저장된 최적화 파라미터를 로드했습니다.")
+            except FileNotFoundError:
+                print("❌ 저장된 파라미터가 없습니다. 최적화를 실행합니다.")
+                optimized_params = self.optimize_models(X_train_full, y_train_full)
+        
+        # 🛡️ 최적화된 파라미터로 견고한 앙상블 훈련
         all_predictions = []
         oof_predictions = np.zeros(len(X_train_full))
         
-        # 🔥 Bootstrap + Multiple CV 전략으로 극대 견고성
-        cv_strategies = [
-            ('KFold', KFold(n_splits=CFG['N_SPLITS'], shuffle=True)),
-            ('RepeatedKFold', RepeatedKFold(n_splits=10, n_repeats=CFG['N_REPEATS'])),
-            ('ShuffleSplit', ShuffleSplit(n_splits=15, test_size=0.2)),
-        ]
-        
-        for seed_idx, seed in enumerate(CFG['SEEDS']):
-            print(f"\n🔄 시드 {seed} ({seed_idx+1}/{len(CFG['SEEDS'])}) 처리 중...")
+        for seed in CFG['SEEDS']:
+            print(f"\n🔄 시드 {seed} 앙상블 훈련 중...")
             seed_everything(seed)
             
-            seed_models = []
             seed_test_preds = []
             
+            # 다양한 CV 전략
+            cv_strategies = [
+                ('KFold', KFold(n_splits=15, shuffle=True, random_state=seed)),
+                ('RepeatedKFold', RepeatedKFold(n_splits=8, n_repeats=2, random_state=seed)),
+                ('ShuffleSplit', ShuffleSplit(n_splits=10, test_size=0.25, random_state=seed))
+            ]
+            
             for cv_name, cv_splitter in cv_strategies:
-                print(f"  CV 전략: {cv_name}")
-                cv_splitter.random_state = seed
-                
-                for fold_idx, (train_idx, val_idx) in enumerate(cv_splitter.split(X_train_full, y_train_full)):
-                    if fold_idx >= 5:  # 시간 절약을 위해 5개 폴드만
+                fold_count = 0
+                for train_idx, val_idx in cv_splitter.split(X_train_full, y_train_full):
+                    fold_count += 1
+                    if fold_count > 3:  # 시간 절약
                         break
                         
                     X_train, X_val = X_train_full[train_idx], X_train_full[val_idx]
                     y_train, y_val = y_train_full.iloc[train_idx], y_train_full.iloc[val_idx]
                     
-                    # 🔥 Bootstrap 샘플링으로 추가 견고성
-                    bootstrap_indices = np.random.choice(len(X_train), size=len(X_train), replace=True)
-                    X_train_bootstrap = X_train[bootstrap_indices]
-                    y_train_bootstrap = y_train.iloc[bootstrap_indices]
-                    
-                    # 다양한 스케일러 사용
-                    scalers = [RobustScaler(), StandardScaler()]
-                    scaler = scalers[fold_idx % len(scalers)]
-                    
-                    X_train_scaled = scaler.fit_transform(X_train_bootstrap)
+                    scaler = RobustScaler()
+                    X_train_scaled = scaler.fit_transform(X_train)
                     X_val_scaled = scaler.transform(X_val)
                     X_test_scaled = scaler.transform(X_test_full)
                     
-                    # 🎯 견고성에 특화된 모델들
-                    robust_models = [
-                        ('lgb', lgb.LGBMRegressor(
-                            objective='regression', metric='rmse', verbose=-1, n_jobs=-1,
-                            n_estimators=2000, learning_rate=0.01, num_leaves=15,
-                            max_depth=6, feature_fraction=0.8, bagging_fraction=0.8,
-                            bagging_freq=5, min_child_samples=20, lambda_l1=0.1, lambda_l2=0.1,
-                            seed=seed
-                        )),
-                        ('xgb', xgb.XGBRegressor(
-                            n_estimators=1500, learning_rate=0.01, max_depth=6,
-                            subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=0.1,
-                            random_state=seed, n_jobs=-1
-                        )),
-                        ('rf', RandomForestRegressor(
-                            n_estimators=800, max_depth=8, min_samples_split=10,
-                            min_samples_leaf=5, max_features=0.8, bootstrap=True,
-                            random_state=seed, n_jobs=-1
-                        )),
-                        ('et', ExtraTreesRegressor(
-                            n_estimators=800, max_depth=8, min_samples_split=10,
-                            min_samples_leaf=5, max_features=0.8, bootstrap=True,
-                            random_state=seed, n_jobs=-1
-                        )),
+                    # 최적화된 모델들 훈련
+                    models = [
+                        ('lgb', lgb.LGBMRegressor(**{**{'objective': 'regression', 'metric': 'rmse', 
+                                                      'verbose': -1, 'n_jobs': -1}, 
+                                                   **optimized_params['lgb']})),
+                        ('xgb', xgb.XGBRegressor(**optimized_params['xgb'])),
+                        ('rf', RandomForestRegressor(**optimized_params['rf'])),
+                        ('et', ExtraTreesRegressor(n_estimators=500, max_depth=8, random_state=seed, n_jobs=-1))
                     ]
                     
-                    fold_models = []
                     fold_test_preds = []
                     
-                    for model_name, model in robust_models:
+                    for model_name, model in models:
                         try:
-                            if model_name in ['lgb', 'xgb']:
-                                if model_name == 'lgb':
-                                    model.fit(X_train_scaled, y_train_bootstrap, 
-                                            eval_set=[(X_val_scaled, y_val)],
-                                            callbacks=[lgb.early_stopping(100, verbose=False)])
-                                else:  # xgb
-                                    try:
-                                        model.fit(X_train_scaled, y_train_bootstrap, 
-                                                eval_set=[(X_val_scaled, y_val)],
-                                                callbacks=[xgb.callback.EarlyStopping(rounds=100)])
-                                    except:
-                                        model.fit(X_train_scaled, y_train_bootstrap)
+                            if model_name == 'lgb':
+                                model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)],
+                                         callbacks=[lgb.early_stopping(100, verbose=False)])
+                            elif model_name == 'xgb':
+                                try:
+                                    model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)],
+                                             callbacks=[xgb.callback.EarlyStopping(rounds=100)])
+                                except:
+                                    model.fit(X_train_scaled, y_train)
                             else:
-                                model.fit(X_train_scaled, y_train_bootstrap)
+                                model.fit(X_train_scaled, y_train)
                             
-                            test_pred = model.predict(X_test_scaled)
                             val_pred = model.predict(X_val_scaled)
-                            
-                            fold_models.append(model)
-                            fold_test_preds.append(test_pred)
+                            test_pred = model.predict(X_test_scaled)
                             
                             # OOF 예측 누적
-                            oof_predictions[val_idx] += val_pred / (len(CFG['SEEDS']) * len(cv_strategies) * 5 * len(robust_models))
+                            oof_predictions[val_idx] += val_pred / (len(CFG['SEEDS']) * len(cv_strategies) * 3 * len(models))
+                            fold_test_preds.append(test_pred)
                             
                         except Exception as e:
                             print(f"    {model_name} 실패: {e}")
                             continue
                     
-                    if fold_models:
-                        seed_models.append(fold_models)
+                    if fold_test_preds:
                         seed_test_preds.append(np.mean(fold_test_preds, axis=0))
             
-            if seed_models:
-                all_models.append(seed_models)
+            if seed_test_preds:
                 all_predictions.append(np.mean(seed_test_preds, axis=0))
         
-        # 🎯 불확실성 고려 최종 앙상블
+        # 최종 앙상블
         if all_predictions:
             final_test_preds = np.mean(all_predictions, axis=0)
-            final_uncertainty = np.std(all_predictions, axis=0)
         else:
             final_test_preds = np.full(len(X_test_full), y_train_full.mean())
-            final_uncertainty = np.zeros(len(X_test_full))
         
         # 성능 평가
         final_score, A, B, corr = self.get_leaderboard_score(y_train_full, oof_predictions)
         
-        # 🎯 무작위 80% 샘플링 시뮬레이션
-        random_80_stats = self.simulate_random_80_percent(y_train_full, oof_predictions)
+        # 무작위 80% 샘플링 시뮬레이션
+        random_scores = []
+        for _ in range(1000):
+            sample_size = int(len(y_train_full) * 0.8)
+            random_indices = np.random.choice(len(y_train_full), size=sample_size, replace=False)
+            score, _, _, _ = self.get_leaderboard_score(y_train_full.iloc[random_indices], 
+                                                       oof_predictions[random_indices])
+            random_scores.append(score)
         
-        print(f"\n🏆 최종 초견고 앙상블 성능:")
+        print(f"\n🏆 최종 최적화된 앙상블 성능:")
         print(f"전체 데이터 스코어: {final_score:.4f}")
-        print(f"무작위 80% 평균: {random_80_stats['mean']:.4f} ± {random_80_stats['std']:.4f}")
-        print(f"무작위 80% 범위: {random_80_stats['min']:.4f} ~ {random_80_stats['max']:.4f}")
-        print(f"무작위 80% Q1-Q3: {random_80_stats['q25']:.4f} ~ {random_80_stats['q75']:.4f}")
+        print(f"무작위 80% 평균: {np.mean(random_scores):.4f} ± {np.std(random_scores):.4f}")
+        print(f"무작위 80% 범위: {np.min(random_scores):.4f} ~ {np.max(random_scores):.4f}")
         print(f"상관관계 (B): {B:.4f}")
-        print(f"예측 불확실성 평균: {np.mean(final_uncertainty):.4f}")
         
-        # 🛡️ 견고성 기반 후처리
-        final_test_preds = self.robust_post_process(final_test_preds, final_uncertainty, y_train_full)
+        # 후처리
+        final_test_preds = np.clip(final_test_preds, 0, 100)
         
         return final_test_preds
 
-    def robust_post_process(self, predictions, uncertainties, y_train):
-        """🛡️ 견고성 기반 후처리"""
-        # 1. 기본 클리핑
-        predictions = np.clip(predictions, 0, 100)
-        
-        # 2. 불확실성이 높은 예측을 보수적으로 조정
-        high_uncertainty_mask = uncertainties > np.percentile(uncertainties, 75)
-        conservative_adjustment = 0.9  # 불확실성이 높으면 조금 더 보수적으로
-        
-        predictions[high_uncertainty_mask] = (
-            predictions[high_uncertainty_mask] * conservative_adjustment + 
-            y_train.mean() * (1 - conservative_adjustment)
-        )
-        
-        # 3. 최종 클리핑
-        predictions = np.clip(predictions, 0, 100)
-        
-        return predictions
-
 def main():
-    print("🛡️ 무작위 80% 샘플링 견고 CYP3A4 예측 모델 🛡️")
-    print("=" * 70)
-    print("🎯 전략: 극대 견고성 + 불확실성 정량화 + 다양성 앙상블")
-    print("⚡ 예상 실행 시간: 15-20분")
+    print("🔥 Optuna 최적화 + 무작위 80% 샘플링 견고 모델 🔥")
+    print("=" * 80)
+    print(f"🎯 Optuna 최적화: {'활성화' if CFG['ENABLE_OPTIMIZATION'] else '비활성화'}")
+    print(f"🔥 최적화 시행 수: {CFG['OPTIMIZATION_TRIALS']}")
+    print(f"⏰ 최적화 타임아웃: {CFG['OPTIMIZATION_TIMEOUT']//60}분")
+    print(f"⚡ 예상 실행 시간: {'60-90분' if CFG['ENABLE_OPTIMIZATION'] else '20-30분'}")
     
     try:
         # 데이터 로드
@@ -409,7 +559,7 @@ def main():
         print(f"0 라벨 개수: {(train_df['Inhibition'] == 0).sum()}개 (모두 유지)")
         
         # 모델 초기화
-        predictor = UltraRobustPredictor()
+        predictor = OptimizedRobustPredictor()
         
         # 견고한 특성 추출
         X_train_full = predictor.prepare_robust_data(train_df, is_training=True)
@@ -418,23 +568,21 @@ def main():
         
         print(f"\n🚀 견고한 특성 수: {X_train_full.shape[1]:,}")
         print(f"🛡️ 시드 개수: {len(CFG['SEEDS'])}개")
-        print(f"📊 Bootstrap 샘플: {CFG['BOOTSTRAP_SAMPLES']}개")
         
-        # 초견고 앙상블 훈련
-        test_preds = predictor.train_ultra_robust_ensemble(X_train_full, y_train_full, X_test_full)
+        # 최적화된 앙상블 훈련
+        test_preds = predictor.train_optimized_ensemble(X_train_full, y_train_full, X_test_full)
         
         # 제출 파일 생성
         submission = sample_submission.copy()
         submission['Inhibition'] = test_preds
         submission['Inhibition'] = np.clip(submission['Inhibition'], 0, 100)
         
-        submission.to_csv('submission_ultra_robust.csv', index=False)
-        print(f"\n✅ 제출 파일이 'submission_ultra_robust.csv'로 저장되었습니다.")
+        submission.to_csv('submission_optimized_robust.csv', index=False)
+        print(f"\n✅ 제출 파일이 'submission_optimized_robust.csv'로 저장되었습니다.")
         
         print("\n🎯 최종 예측 결과 요약:")
         print(submission['Inhibition'].describe())
-        print(f"\n🏆 목표: 무작위 80% 샘플링에 견고한 일관된 성능!")
-        print(f"🛡️ 핵심: 예측 안정성 > RMSE 최적화")
+        print(f"\n🏆 목표: Optuna 최적화로 무작위 80% 샘플링에 견고한 최고 성능!")
 
     except Exception as e:
         print(f"❌ 실행 중 오류 발생: {e}")
