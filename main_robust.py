@@ -1,591 +1,501 @@
+# 🤖 Word2Vec 기반 CYP3A4 예측 모델 (0.85+ 도전)
 import pandas as pd
 import numpy as np
 import os
 import random
 import pickle
-import warnings
 from rdkit import Chem
-from rdkit.Chem import AllChem, DataStructs, Descriptors, rdMolDescriptors
-from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, QuantileTransformer
-from sklearn.impute import SimpleImputer
-from sklearn.model_selection import KFold, RepeatedKFold, StratifiedKFold, ShuffleSplit
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, ExtraTreesRegressor
-from sklearn.svm import SVR
-from sklearn.neural_network import MLPRegressor
-from sklearn.linear_model import Ridge, ElasticNet, BayesianRidge, HuberRegressor
+from rdkit.Chem import AllChem, DataStructs, Descriptors
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import KFold
+from sklearn.metrics import r2_score, mean_squared_error
 import lightgbm as lgb
-import xgboost as xgb
-import catboost as cb
 import optuna
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy import stats
+import warnings
 
 warnings.filterwarnings('ignore')
 
-# 🛡️ 무작위 80% 샘플링 견고성에 특화된 설정
+# 🤖 Word2Vec 기반 설정 (0.85+ 목표)
 CFG = {
-    'NBITS': 2048,
-    'SEEDS': [42, 123, 456, 789, 999],  # 5개 시드로 균형
-    'N_SPLITS': 10,        # 최적화 시 빠른 실행
-    'N_REPEATS': 2,        # 반복 교차검증
-    'OPTIMIZATION_TRIALS': 100,  # 🔥 Optuna 최적화 시행 수
-    'ENSEMBLE_TRIALS': 200,      # 앙상블 시 더 많은 시행
-    'ENABLE_OPTIMIZATION': True,  # 🎯 Optuna 최적화 활성화
-    'OPTIMIZATION_TIMEOUT': 3600,  # 1시간 최적화 타임아웃
-    'RANDOM_SAMPLING_WEIGHT': 0.8,  # 무작위 샘플링 가중치
-    'STABILITY_WEIGHT': 0.2,         # 안정성 가중치
+    'NBITS': 2048,      # Morgan 지문 비트 수 (1024 사용)
+    'SEEDS': [42, 123, 456, 789, 999],  # 🛡️ 다중 시드로 안정성 확보
+    'N_SPLITS': 15,     # K-폴드 증가 (안정성)
+    'N_TRIALS': 50,     # 빠른 실행을 위해 축소
+    'SIMULATE_80_PERCENT': True,  # 🎲 무작위 80% 시뮬레이션
+    'N_SIMULATIONS': 20,  # 80% 샘플링 시뮬레이션 횟수
+    'TARGET_TRANSFORM': True,  # 🎯 타겟 변환 활성화
+    'WORD2VEC_DIM': 300,  # 🤖 Word2Vec 벡터 차원
 }
 
 def seed_everything(seed):
+    """모든 랜덤 시드를 설정하여 재현성 보장"""
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
 
-class OptimizedRobustPredictor:
-    def __init__(self):
-        self.models = {}
-        self.scalers = {}
-        self.imputer = SimpleImputer(strategy='median')
-        self.optimized_params = {}
+def simulate_random_80_percent(y_true, y_pred, n_simulations=20):
+    """🎲 무작위 80% 샘플링 시뮬레이션 (리더보드 평가 방식 모방)"""
+    scores = []
+    n_samples = len(y_true)
+    
+    for _ in range(n_simulations):
+        # 무작위 80% 샘플링
+        indices = np.random.choice(n_samples, size=int(0.8 * n_samples), replace=False)
+        y_true_sample = y_true[indices]
+        y_pred_sample = y_pred[indices]
         
-    def get_core_descriptors(self, mol):
-        """핵심 분자 설명자"""
-        try:
-            desc_dict = {
-                'MolWt': Descriptors.MolWt(mol),
-                'LogP': Descriptors.MolLogP(mol),
-                'TPSA': Descriptors.TPSA(mol),
-                'NumHDonors': Descriptors.NumHDonors(mol),
-                'NumHAcceptors': Descriptors.NumHAcceptors(mol),
-                'NumRotatableBonds': Descriptors.NumRotatableBonds(mol),
-                'NumAromaticRings': Descriptors.NumAromaticRings(mol),
-                'NumSaturatedRings': Descriptors.NumSaturatedRings(mol),
-                'NumAliphaticRings': Descriptors.NumAliphaticRings(mol),
-                'HeavyAtomCount': Descriptors.HeavyAtomCount(mol),
-                'RingCount': Descriptors.RingCount(mol),
-                'BertzCT': Descriptors.BertzCT(mol),
-            }
-            return desc_dict
-        except:
-            return {key: 0 for key in ['MolWt', 'LogP', 'TPSA', 'NumHDonors', 'NumHAcceptors', 
-                                      'NumRotatableBonds', 'NumAromaticRings', 'NumSaturatedRings',
-                                      'NumAliphaticRings', 'HeavyAtomCount', 'RingCount', 'BertzCT']}
+        # 스코어 계산
+        rmse = np.sqrt(mean_squared_error(y_true_sample, y_pred_sample))
+        y_range = y_true_sample.max() - y_true_sample.min()
+        nrmse = rmse / y_range if y_range > 0 else 0
+        
+        correlation = np.corrcoef(y_true_sample, y_pred_sample)[0, 1]
+        if np.isnan(correlation):
+            correlation = 0
+            
+        score = 0.5 * (1 - nrmse) + 0.5 * correlation
+        scores.append(score)
+    
+    return np.mean(scores), np.std(scores)
 
-    def smiles_to_robust_features(self, smiles):
-        """견고한 특성 추출"""
+# 첫 번째 시드로 초기 설정
+seed_everything(CFG['SEEDS'][0])
+
+class Word2VecCYP3A4Predictor:
+    def __init__(self):
+        self.model = None
+        self.scaler = StandardScaler()
+        self.best_params = None
+        # 모든 RDKit 설명자 이름
+        self.descriptor_names = [desc_name for desc_name, _ in Descriptors._descList]
+        # 🎯 타겟 변환 추가
+        self.target_transformer = None
+        self.use_target_transform = True
+        # 🤖 Word2Vec 모델 로드
+        self.word2vec_model = None
+        self.load_word2vec_model()
+    
+    def load_word2vec_model(self):
+        """🤖 Word2Vec 모델 로드"""
+        try:
+            with open('model_300dim.pkl', 'rb') as f:
+                self.word2vec_model = pickle.load(f)
+            print("✅ Word2Vec 모델 로드 성공 (300차원)")
+        except Exception as e:
+            print(f"❌ Word2Vec 모델 로드 실패: {e}")
+            print("Word2Vec 없이 Morgan 기반으로 진행합니다.")
+            self.word2vec_model = None
+    
+    def tokenize_smiles(self, smiles):
+        """🧬 SMILES를 토큰으로 분리"""
+        tokens = []
+        i = 0
+        while i < len(smiles):
+            # 두 글자 토큰들 먼저 확인
+            if i < len(smiles) - 1:
+                two_char = smiles[i:i+2]
+                if two_char in ['Cl', 'Br', 'Si', 'Na', 'Mg', 'Al', 'Ca', 'Fe', 'Cu', 'Zn']:
+                    tokens.append(two_char)
+                    i += 2
+                    continue
+            
+            # 한 글자 토큰
+            tokens.append(smiles[i])
+            i += 1
+        
+        return tokens
+    
+    def smiles_to_word2vec(self, smiles):
+        """🤖 SMILES를 Word2Vec 벡터로 변환"""
+        if self.word2vec_model is None:
+            return np.zeros(300)  # 기본 300차원 영벡터
+        
+        tokens = self.tokenize_smiles(smiles)
+        vectors = []
+        
+        for token in tokens:
+            try:
+                # Word2Vec 벡터 추출
+                vector = self.word2vec_model.wv[token]
+                vectors.append(vector)
+            except (KeyError, AttributeError):
+                # 토큰이 없으면 무시
+                continue
+        
+        if vectors:
+            # 평균 벡터 계산 (분자 전체 표현)
+            return np.mean(vectors, axis=0)
+        else:
+            # 벡터가 없으면 영벡터
+            return np.zeros(300)
+
+    def smiles_to_features(self, smiles):
+        """🤖 Word2Vec + Morgan 조합 특성 추출"""
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             return None
-
-        try:
-            # 1. Multiple Morgan Fingerprints
-            morgan_features = []
-            for radius in [1, 2, 3]:
-                fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=CFG['NBITS'])
-                arr = np.zeros((CFG['NBITS'],))
-                DataStructs.ConvertToNumpyArray(fp, arr)
-                morgan_features.append(arr)
-
-            # 2. MACCS Keys
-            fp_maccs = AllChem.GetMACCSKeysFingerprint(mol)
-            arr_maccs = np.zeros((167,))
-            DataStructs.ConvertToNumpyArray(fp_maccs, arr_maccs)
-
-            # 3. 핵심 분자 설명자
-            descriptors = self.get_core_descriptors(mol)
-
-            # 4. CYP3A4 핵심 구조 알림
-            structural_alerts = {
-                'HasBenzene': int(mol.HasSubstructMatch(Chem.MolFromSmarts('c1ccccc1'))),
-                'HasPyridine': int(mol.HasSubstructMatch(Chem.MolFromSmarts('c1ccncc1'))),
-                'HasImidazole': int(mol.HasSubstructMatch(Chem.MolFromSmarts('c1cnc[nH]1'))),
-                'HasAmide': int(mol.HasSubstructMatch(Chem.MolFromSmarts('C(=O)N'))),
-                'HasEster': int(mol.HasSubstructMatch(Chem.MolFromSmarts('C(=O)O'))),
-                'HasFluorine': int(mol.HasSubstructMatch(Chem.MolFromSmarts('[F]'))),
-                'HasChlorine': int(mol.HasSubstructMatch(Chem.MolFromSmarts('[Cl]'))),
-                'HasNitro': int(mol.HasSubstructMatch(Chem.MolFromSmarts('[N+](=O)[O-]'))),
-                'HasTrifluoromethyl': int(mol.HasSubstructMatch(Chem.MolFromSmarts('C(F)(F)F'))),
-                'HasIndole': int(mol.HasSubstructMatch(Chem.MolFromSmarts('c1ccc2[nH]ccc2c1'))),
-            }
-
-            return morgan_features, arr_maccs, descriptors, structural_alerts
-            
-        except Exception as e:
-            return None
-
-    def prepare_robust_data(self, df, is_training=True):
-        """견고한 데이터 준비"""
-        print("견고한 특성 추출 중...")
         
-        all_features = []
-        failed_count = 0
+        # 🤖 1. Word2Vec 벡터 (300차원) - 핵심 혁신!
+        word2vec_features = self.smiles_to_word2vec(smiles)
         
-        for i, smiles in enumerate(df['Canonical_Smiles']):
-            if i % 200 == 0:
-                print(f"처리 중: {i}/{len(df)}")
-            
-            result = self.smiles_to_robust_features(smiles)
-            
-            if result is None:
-                failed_count += 1
-                morgan_features = [np.zeros(CFG['NBITS']) for _ in range(3)]
-                arr_maccs = np.zeros(167)
-                descriptors = {key: 0 for key in ['MolWt', 'LogP', 'TPSA', 'NumHDonors', 'NumHAcceptors', 
-                                                 'NumRotatableBonds', 'NumAromaticRings', 'NumSaturatedRings',
-                                                 'NumAliphaticRings', 'HeavyAtomCount', 'RingCount', 'BertzCT']}
-                structural_alerts = {key: 0 for key in ['HasBenzene', 'HasPyridine', 'HasImidazole', 
-                                                       'HasAmide', 'HasEster', 'HasFluorine', 
-                                                       'HasChlorine', 'HasNitro', 'HasTrifluoromethyl', 'HasIndole']}
-            else:
-                morgan_features, arr_maccs, descriptors, structural_alerts = result
-
-            all_features.append((morgan_features, arr_maccs, list(descriptors.values()), 
-                               list(structural_alerts.values())))
-
-        # 특성 결합
-        morgan_all = np.hstack([np.array([item[0][i] for item in all_features]) for i in range(3)])
-        maccs_all = np.array([item[1] for item in all_features])
-        desc_all = np.array([item[2] for item in all_features])
-        alert_all = np.array([item[3] for item in all_features])
-
-        X = np.hstack([morgan_all, maccs_all, desc_all, alert_all])
-        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        # 🧬 2. Morgan Fingerprint (단일 radius=2, 1024 bits)
+        fp_morgan = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=1024)
+        arr_morgan = np.zeros((1024,))
+        DataStructs.ConvertToNumpyArray(fp_morgan, arr_morgan)
         
+        # 3. MACCS Keys (167 bits)
+        fp_maccs = AllChem.GetMACCSKeysFingerprint(mol)
+        arr_maccs = np.zeros((167,))
+        DataStructs.ConvertToNumpyArray(fp_maccs, arr_maccs)
+        
+        # 🎯 4. 핵심 RDKit Descriptors (12개)
+        core_descriptors = []
+        important_descs = [
+            'MolWt', 'MolLogP', 'NumHDonors', 'NumHAcceptors', 'TPSA',
+            'NumRotatableBonds', 'NumAromaticRings', 'NumAliphaticRings',
+            'NumHeteroatoms', 'FractionCsp3', 'LabuteASA', 'BertzCT'
+        ]
+        
+        for desc_name in important_descs:
+            try:
+                desc_func = getattr(Descriptors, desc_name)
+                desc_value = desc_func(mol)
+                core_descriptors.append(desc_value if desc_value is not None else 0)
+            except:
+                core_descriptors.append(0)
+        
+        # 🤖 모든 특성 결합: Word2Vec + Morgan + MACCS + Descriptors
+        features = np.concatenate([word2vec_features, arr_morgan, arr_maccs, core_descriptors])
+        return features
+
+    def prepare_data(self, df, is_training=True):
+        """📊 데이터 전처리 + 타겟 변환"""
+        smiles_col = 'Canonical_Smiles' if 'Canonical_Smiles' in df.columns else 'SMILES'
+        
+        print(f"특성 추출 중... ({len(df)}개 분자)")
+        features_list = []
+        valid_indices = []
+        
+        for idx, smiles in enumerate(df[smiles_col]):
+            features = self.smiles_to_features(smiles)
+            if features is not None:
+                features_list.append(features)
+                valid_indices.append(idx)
+            
+            if (idx + 1) % 100 == 0:
+                print(f"  진행: {idx + 1}/{len(df)}")
+        
+        if not features_list:
+            raise ValueError("유효한 분자가 없습니다!")
+        
+        X = np.array(features_list)
+        print(f"✅ 특성 추출 완료: {X.shape[1]:,}개 특성")
+        
+        # NaN/Inf 처리
+        X = np.nan_to_num(X, nan=0, posinf=0, neginf=0)
+        
+        # 스케일링
         if is_training:
-            X = self.imputer.fit_transform(X)
+            X = self.scaler.fit_transform(X)
         else:
-            X = self.imputer.transform(X)
+            X = self.scaler.transform(X)
         
-        print(f"✅ 견고한 특성 추출 완료: {X.shape[1]:,}개 특성")
-        return X
+        return X, valid_indices
+    
+    def transform_target(self, y, fit=False):
+        """🎯 타겟 변환 (sqrt로 분포 개선)"""
+        if not self.use_target_transform:
+            return y
+            
+        if fit:
+            # sqrt 변환 (0에 가까운 값들 처리)
+            y_transformed = np.sqrt(y + 1)  # +1로 0 처리
+            self.target_mean = np.mean(y_transformed)
+            self.target_std = np.std(y_transformed)
+            return y_transformed
+        else:
+            # 기존 변환 적용
+            return np.sqrt(y + 1)
+    
+    def inverse_transform_target(self, y_transformed):
+        """🎯 타겟 역변환"""
+        if not self.use_target_transform:
+            return y_transformed
+            
+        # sqrt 역변환
+        y_original = np.square(y_transformed) - 1
+        return np.clip(y_original, 0, 100)  # 범위 보정
 
-    def get_leaderboard_score(self, y_true, y_pred):
-        """정확한 리더보드 평가 지표"""
-        mse = mean_squared_error(y_true, y_pred)
-        rmse = np.sqrt(mse)
-        y_range = np.max(y_true) - np.min(y_true)
-        normalized_rmse = rmse / y_range
-        A = min(normalized_rmse, 1)
+    def get_score(self, y_true, y_pred):
+        """리더보드 스코어 계산: 0.5 * (1 - NRMSE) + 0.5 * Pearson_Correlation"""
+        # RMSE 계산
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
         
+        # Normalized RMSE
+        y_range = y_true.max() - y_true.min()
+        nrmse = rmse / y_range if y_range > 0 else 0
+        
+        # Pearson 상관관계
         correlation = np.corrcoef(y_true, y_pred)[0, 1]
         if np.isnan(correlation):
             correlation = 0
-        B = np.clip(correlation, 0, 1)
         
-        score = 0.5 * (1 - A) + 0.5 * B
-        return score, A, B, correlation
+        # 최종 스코어
+        score = 0.5 * (1 - nrmse) + 0.5 * correlation
+        return score
 
-    def simulate_random_80_percent_cv(self, y_true, y_pred, n_simulations=100):
-        """🎯 교차검증용 빠른 무작위 80% 샘플링 시뮬레이션"""
-        scores = []
-        indices = np.arange(len(y_true))
+    def objective(self, trial, X, y):
+        """🤖 Word2Vec + 견고성 Optuna 최적화"""
+        # 🎯 타겟 변환 적용
+        y_transformed = self.transform_target(y, fit=True)
         
-        for _ in range(n_simulations):
-            sample_size = int(len(indices) * 0.8)
-            random_indices = np.random.choice(indices, size=sample_size, replace=False)
-            
-            y_true_sample = y_true.iloc[random_indices] if hasattr(y_true, 'iloc') else y_true[random_indices]
-            y_pred_sample = y_pred[random_indices]
-            
-            score, _, _, _ = self.get_leaderboard_score(y_true_sample, y_pred_sample)
-            scores.append(score)
-        
-        return np.mean(scores), np.std(scores)
-
-    def objective_lgb(self, trial, X, y):
-        """🔥 LightGBM 무작위 80% 샘플링 최적화 목적함수"""
+        # 🎯 약간 더 공격적인 하이퍼파라미터 (0.85+ 목표)
         params = {
             'objective': 'regression',
             'metric': 'rmse',
             'verbose': -1,
             'n_jobs': -1,
-            'seed': trial.suggest_categorical('seed', CFG['SEEDS']),
+            'seed': CFG['SEEDS'][0],
             'boosting_type': 'gbdt',
-            'n_estimators': trial.suggest_int('n_estimators', 1000, 4000),
-            'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.05, log=True),
-            'num_leaves': trial.suggest_int('num_leaves', 8, 40),
-            'max_depth': trial.suggest_int('max_depth', 3, 10),
-            'feature_fraction': trial.suggest_float('feature_fraction', 0.4, 0.9),
-            'bagging_fraction': trial.suggest_float('bagging_fraction', 0.4, 0.9),
-            'bagging_freq': trial.suggest_int('bagging_freq', 1, 10),
-            'min_child_samples': trial.suggest_int('min_child_samples', 10, 100),
-            'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 10.0, log=True),
-            'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 10.0, log=True),
-            'min_split_gain': trial.suggest_float('min_split_gain', 1e-8, 1.0, log=True),
+            'n_estimators': trial.suggest_int('n_estimators', 800, 2000),  # 범위 확대
+            'learning_rate': trial.suggest_float('learning_rate', 0.03, 0.12),  # 범위 확대
+            'num_leaves': trial.suggest_int('num_leaves', 15, 80),  # 범위 확대
+            'max_depth': trial.suggest_int('max_depth', 4, 10),  # 범위 확대
+            'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 0.95),
+            'bagging_fraction': trial.suggest_float('bagging_fraction', 0.7, 0.95),
+            'bagging_freq': trial.suggest_int('bagging_freq', 3, 7),
+            'min_child_samples': trial.suggest_int('min_child_samples', 15, 45),  # 범위 조정
+            'lambda_l1': trial.suggest_float('lambda_l1', 0.001, 0.5),  # 정규화 완화
+            'lambda_l2': trial.suggest_float('lambda_l2', 0.001, 0.5),
         }
-
-        # 🎯 무작위 80% 샘플링 견고성 평가
-        cv_scores = []
-        random_sampling_scores = []
         
-        # 다양한 CV 전략으로 견고성 확인
-        cv_strategies = [
-            KFold(n_splits=CFG['N_SPLITS'], shuffle=True, random_state=42),
-            RepeatedKFold(n_splits=5, n_repeats=CFG['N_REPEATS'], random_state=42),
-            ShuffleSplit(n_splits=8, test_size=0.2, random_state=42)
-        ]
+        # K-폴드 교차 검증
+        kf = KFold(n_splits=CFG['N_SPLITS'], shuffle=True, random_state=CFG['SEEDS'][0])
+        all_y_true = []
+        all_y_pred = []
         
-        for cv_strategy in cv_strategies:
-            for train_idx, val_idx in cv_strategy.split(X, y):
-                X_train, X_val = X[train_idx], X[val_idx]
-                y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-
-                scaler = RobustScaler()
-                X_train_scaled = scaler.fit_transform(X_train)
-                X_val_scaled = scaler.transform(X_val)
-
-                model = lgb.LGBMRegressor(**params)
-                model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)],
-                          callbacks=[lgb.early_stopping(200, verbose=False)])
-                
-                y_pred = model.predict(X_val_scaled)
-                
-                # 기본 스코어
-                score, _, _, _ = self.get_leaderboard_score(y_val, y_pred)
-                cv_scores.append(score)
-                
-                # 🎯 무작위 80% 샘플링 시뮬레이션
-                random_mean, random_std = self.simulate_random_80_percent_cv(y_val, y_pred)
-                random_sampling_scores.append(random_mean)
-                
-                # 시간 절약을 위해 일부만 평가
-                if len(cv_scores) >= 10:
-                    break
-            if len(cv_scores) >= 10:
-                break
-
-        # 🛡️ 견고성 점수 계산
-        base_score = np.mean(cv_scores)
-        random_score = np.mean(random_sampling_scores)
-        stability_score = 1.0 / (1.0 + np.std(cv_scores))  # 안정성 점수
-        
-        # 🎯 최종 목적함수: 무작위 샘플링 성능 + 안정성
-        final_score = (CFG['RANDOM_SAMPLING_WEIGHT'] * random_score + 
-                      CFG['STABILITY_WEIGHT'] * stability_score)
-        
-        return final_score
-
-    def objective_xgb(self, trial, X, y):
-        """🔥 XGBoost 무작위 80% 샘플링 최적화 목적함수"""
-        params = {
-            'n_estimators': trial.suggest_int('n_estimators', 1000, 4000),
-            'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.05, log=True),
-            'max_depth': trial.suggest_int('max_depth', 3, 10),
-            'subsample': trial.suggest_float('subsample', 0.4, 0.9),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.4, 0.9),
-            'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
-            'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
-            'min_child_weight': trial.suggest_int('min_child_weight', 1, 20),
-            'gamma': trial.suggest_float('gamma', 1e-8, 1.0, log=True),
-            'random_state': trial.suggest_categorical('random_state', CFG['SEEDS']),
-            'n_jobs': -1,
-        }
-
-        cv_scores = []
-        random_sampling_scores = []
-        
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        for train_idx, val_idx in kf.split(X, y):
+        for train_idx, val_idx in kf.split(X, y_transformed):
             X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-
-            scaler = RobustScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_val_scaled = scaler.transform(X_val)
-
-            model = xgb.XGBRegressor(**params)
-            try:
-                model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)],
-                         callbacks=[xgb.callback.EarlyStopping(rounds=200)])
-            except:
-                model.fit(X_train_scaled, y_train)
+            y_train, y_val = y_transformed[train_idx], y_transformed[val_idx]
             
-            y_pred = model.predict(X_val_scaled)
+            # 모델 훈련
+            model = lgb.LGBMRegressor(**params)
+            model.fit(
+                X_train, y_train,
+                eval_set=[(X_val, y_val)],
+                eval_metric='rmse',
+                callbacks=[lgb.early_stopping(50, verbose=False)]
+            )
             
-            score, _, _, _ = self.get_leaderboard_score(y_val, y_pred)
-            cv_scores.append(score)
+            # 예측 및 역변환
+            y_pred_transformed = model.predict(X_val)
+            y_pred = self.inverse_transform_target(y_pred_transformed)
+            y_true = y[val_idx]  # 원본 타겟 사용
             
-            random_mean, _ = self.simulate_random_80_percent_cv(y_val, y_pred)
-            random_sampling_scores.append(random_mean)
-
-        base_score = np.mean(cv_scores)
-        random_score = np.mean(random_sampling_scores)
-        stability_score = 1.0 / (1.0 + np.std(cv_scores))
+            all_y_true.extend(y_true)
+            all_y_pred.extend(y_pred)
         
-        final_score = (CFG['RANDOM_SAMPLING_WEIGHT'] * random_score + 
-                      CFG['STABILITY_WEIGHT'] * stability_score)
+        all_y_true = np.array(all_y_true)
+        all_y_pred = np.array(all_y_pred)
         
-        return final_score
-
-    def objective_rf(self, trial, X, y):
-        """🔥 RandomForest 무작위 80% 샘플링 최적화 목적함수"""
-        params = {
-            'n_estimators': trial.suggest_int('n_estimators', 200, 1500),
-            'max_depth': trial.suggest_int('max_depth', 5, 20),
-            'min_samples_split': trial.suggest_int('min_samples_split', 5, 50),
-            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 2, 20),
-            'max_features': trial.suggest_float('max_features', 0.4, 1.0),
-            'bootstrap': trial.suggest_categorical('bootstrap', [True, False]),
-            'random_state': trial.suggest_categorical('random_state', CFG['SEEDS']),
-            'n_jobs': -1,
-        }
-
-        cv_scores = []
-        random_sampling_scores = []
-        
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        for train_idx, val_idx in kf.split(X, y):
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-
-            scaler = RobustScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_val_scaled = scaler.transform(X_val)
-
-            model = RandomForestRegressor(**params)
-            model.fit(X_train_scaled, y_train)
-            
-            y_pred = model.predict(X_val_scaled)
-            
-            score, _, _, _ = self.get_leaderboard_score(y_val, y_pred)
-            cv_scores.append(score)
-            
-            random_mean, _ = self.simulate_random_80_percent_cv(y_val, y_pred)
-            random_sampling_scores.append(random_mean)
-
-        base_score = np.mean(cv_scores)
-        random_score = np.mean(random_sampling_scores)
-        stability_score = 1.0 / (1.0 + np.std(cv_scores))
-        
-        final_score = (CFG['RANDOM_SAMPLING_WEIGHT'] * random_score + 
-                      CFG['STABILITY_WEIGHT'] * stability_score)
-        
-        return final_score
-
-    def optimize_models(self, X_train, y_train):
-        """🔥 다중 모델 Optuna 최적화"""
-        print("🔥 Optuna 하이퍼파라미터 최적화 시작...")
-        
-        optimized_params = {}
-        
-        # 1. LightGBM 최적화
-        print("\n🎯 LightGBM 최적화 중...")
-        study_lgb = optuna.create_study(direction='maximize', 
-                                       sampler=optuna.samplers.TPESampler(seed=42),
-                                       pruner=optuna.pruners.MedianPruner())
-        study_lgb.optimize(lambda trial: self.objective_lgb(trial, X_train, y_train), 
-                          n_trials=CFG['OPTIMIZATION_TRIALS'],
-                          timeout=CFG['OPTIMIZATION_TIMEOUT']//3)
-        
-        optimized_params['lgb'] = study_lgb.best_params
-        print(f"✅ LightGBM 최적화 완료 - 최고 스코어: {study_lgb.best_value:.4f}")
-        print(f"최적 파라미터: {study_lgb.best_params}")
-        
-        # 2. XGBoost 최적화
-        print("\n🎯 XGBoost 최적화 중...")
-        study_xgb = optuna.create_study(direction='maximize', 
-                                       sampler=optuna.samplers.TPESampler(seed=123),
-                                       pruner=optuna.pruners.MedianPruner())
-        study_xgb.optimize(lambda trial: self.objective_xgb(trial, X_train, y_train), 
-                          n_trials=CFG['OPTIMIZATION_TRIALS'],
-                          timeout=CFG['OPTIMIZATION_TIMEOUT']//3)
-        
-        optimized_params['xgb'] = study_xgb.best_params
-        print(f"✅ XGBoost 최적화 완료 - 최고 스코어: {study_xgb.best_value:.4f}")
-        print(f"최적 파라미터: {study_xgb.best_params}")
-        
-        # 3. RandomForest 최적화
-        print("\n🎯 RandomForest 최적화 중...")
-        study_rf = optuna.create_study(direction='maximize', 
-                                      sampler=optuna.samplers.TPESampler(seed=456),
-                                      pruner=optuna.pruners.MedianPruner())
-        study_rf.optimize(lambda trial: self.objective_rf(trial, X_train, y_train), 
-                         n_trials=CFG['OPTIMIZATION_TRIALS'],
-                         timeout=CFG['OPTIMIZATION_TIMEOUT']//3)
-        
-        optimized_params['rf'] = study_rf.best_params
-        print(f"✅ RandomForest 최적화 완료 - 최고 스코어: {study_rf.best_value:.4f}")
-        print(f"최적 파라미터: {study_rf.best_params}")
-        
-        self.optimized_params = optimized_params
-        
-        # 최적화 결과 저장
-        with open('optimized_params.pkl', 'wb') as f:
-            pickle.dump(optimized_params, f)
-        print("\n💾 최적화된 파라미터가 'optimized_params.pkl'에 저장되었습니다.")
-        
-        return optimized_params
-
-    def train_optimized_ensemble(self, X_train_full, y_train_full, X_test_full):
-        """🎯 최적화된 파라미터로 견고한 앙상블 훈련"""
-        print("🎯 최적화된 파라미터로 견고한 앙상블 훈련 시작...")
-        
-        if CFG['ENABLE_OPTIMIZATION']:
-            # Optuna 최적화 실행
-            optimized_params = self.optimize_models(X_train_full, y_train_full)
+        # 🎲 무작위 80% 시뮬레이션 스코어 (리더보드 모방)
+        if CFG['SIMULATE_80_PERCENT']:
+            robust_score, score_std = simulate_random_80_percent(
+                all_y_true, all_y_pred, CFG['N_SIMULATIONS']
+            )
+            # 안정성 보너스: 표준편차가 낮을수록 좋음
+            stability_bonus = max(0, 0.1 - score_std)
+            return robust_score + stability_bonus
         else:
-            # 저장된 파라미터 로드
-            try:
-                with open('optimized_params.pkl', 'rb') as f:
-                    optimized_params = pickle.load(f)
-                print("💾 저장된 최적화 파라미터를 로드했습니다.")
-            except FileNotFoundError:
-                print("❌ 저장된 파라미터가 없습니다. 최적화를 실행합니다.")
-                optimized_params = self.optimize_models(X_train_full, y_train_full)
+            # 기본 스코어
+            return self.get_score(all_y_true, all_y_pred)
+
+    def train(self, X_train, y_train):
+        """🤖 Word2Vec 기반 모델 훈련 (분자 시퀀스 학습 + Optuna)"""
+        print("\n🤖 Word2Vec 기반 Optuna 최적화...")
+        print("🤖 SMILES 시퀀스 패턴 학습 (300차원)")
+        print("🧬 Morgan + MACCS + 핵심 Descriptors")
+        print("🎯 타겟 변환 (sqrt) 적용")
+        if CFG['SIMULATE_80_PERCENT']:
+            print(f"🎲 무작위 80% 샘플링 시뮬레이션 활성화 ({CFG['N_SIMULATIONS']}회)")
         
-        # 🛡️ 최적화된 파라미터로 견고한 앙상블 훈련
+        # Optuna 최적화
+        study = optuna.create_study(direction='maximize', study_name='word2vec_lgbm')
+        study.optimize(lambda trial: self.objective(trial, X_train, y_train), n_trials=CFG['N_TRIALS'])
+        
+        print(f"✅ Word2Vec 최적화 완료! 최고 스코어: {study.best_value:.4f}")
+        print(f"최적 파라미터: {study.best_params}")
+        
+        # 최적 파라미터 저장
+        self.best_params = {
+            'objective': 'regression',
+            'metric': 'rmse',
+            'verbose': -1,
+            'n_jobs': -1,
+            'seed': CFG['SEEDS'][0],
+            'boosting_type': 'gbdt',
+            'n_estimators': 1500  # 기본값
+        }
+            
+        self.best_params.update(study.best_params)
+        
+        return study.best_value
+
+    def predict(self, X_test):
+        """🤖 Word2Vec + 다중 시드 견고 앙상블 예측"""
+        print("🤖 Word2Vec 견고 앙상블 예측...")
+        print(f"🔢 시드 수: {len(CFG['SEEDS'])}, 폴드 수: {CFG['N_SPLITS']}")
+        print(f"🎯 총 모델 수: {len(CFG['SEEDS']) * CFG['N_SPLITS']}")
+        
+        # 훈련 데이터
+        X_train = self.X_train_stored
+        y_train = self.y_train_stored
+        y_train_transformed = self.transform_target(y_train, fit=False)  # 타겟 변환
+        
         all_predictions = []
-        oof_predictions = np.zeros(len(X_train_full))
         
-        for seed in CFG['SEEDS']:
-            print(f"\n🔄 시드 {seed} 앙상블 훈련 중...")
-            seed_everything(seed)
+        # 다중 시드 앙상블
+        for seed_idx, seed in enumerate(CFG['SEEDS']):
+            print(f"\n🔄 시드 {seed} ({seed_idx + 1}/{len(CFG['SEEDS'])}) 처리 중...")
             
-            seed_test_preds = []
+            # 시드별 K-폴드
+            kf = KFold(n_splits=CFG['N_SPLITS'], shuffle=True, random_state=seed)
+            seed_preds = np.zeros(len(X_test))
             
-            # 다양한 CV 전략
-            cv_strategies = [
-                ('KFold', KFold(n_splits=15, shuffle=True, random_state=seed)),
-                ('RepeatedKFold', RepeatedKFold(n_splits=8, n_repeats=2, random_state=seed)),
-                ('ShuffleSplit', ShuffleSplit(n_splits=10, test_size=0.25, random_state=seed))
-            ]
+            for fold, (train_idx, _) in enumerate(kf.split(X_train, y_train_transformed)):
+                if fold % 5 == 0:  # 5개 폴드마다 출력
+                    print(f"  시드 {seed} - 폴드 {fold + 1}/{CFG['N_SPLITS']}")
+                
+                X_fold_train = X_train[train_idx]
+                y_fold_train = y_train_transformed[train_idx]  # 변환된 타겟 사용
+                
+                # 모델 훈련 (시드별 파라미터)
+                params = self.best_params.copy()
+                params['seed'] = seed
+                
+                model = lgb.LGBMRegressor(**params)
+                model.fit(X_fold_train, y_fold_train)
+                
+                # 테스트 예측 (변환된 타겟 공간)
+                fold_pred_transformed = model.predict(X_test)
+                # 역변환
+                fold_pred = self.inverse_transform_target(fold_pred_transformed)
+                seed_preds += fold_pred / CFG['N_SPLITS']
             
-            for cv_name, cv_splitter in cv_strategies:
-                fold_count = 0
-                for train_idx, val_idx in cv_splitter.split(X_train_full, y_train_full):
-                    fold_count += 1
-                    if fold_count > 3:  # 시간 절약
-                        break
-                        
-                    X_train, X_val = X_train_full[train_idx], X_train_full[val_idx]
-                    y_train, y_val = y_train_full.iloc[train_idx], y_train_full.iloc[val_idx]
-                    
-                    scaler = RobustScaler()
-                    X_train_scaled = scaler.fit_transform(X_train)
-                    X_val_scaled = scaler.transform(X_val)
-                    X_test_scaled = scaler.transform(X_test_full)
-                    
-                    # 최적화된 모델들 훈련
-                    models = [
-                        ('lgb', lgb.LGBMRegressor(**{**{'objective': 'regression', 'metric': 'rmse', 
-                                                      'verbose': -1, 'n_jobs': -1}, 
-                                                   **optimized_params['lgb']})),
-                        ('xgb', xgb.XGBRegressor(**optimized_params['xgb'])),
-                        ('rf', RandomForestRegressor(**optimized_params['rf'])),
-                        ('et', ExtraTreesRegressor(n_estimators=500, max_depth=8, random_state=seed, n_jobs=-1))
-                    ]
-                    
-                    fold_test_preds = []
-                    
-                    for model_name, model in models:
-                        try:
-                            if model_name == 'lgb':
-                                model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)],
-                                         callbacks=[lgb.early_stopping(100, verbose=False)])
-                            elif model_name == 'xgb':
-                                try:
-                                    model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)],
-                                             callbacks=[xgb.callback.EarlyStopping(rounds=100)])
-                                except:
-                                    model.fit(X_train_scaled, y_train)
-                            else:
-                                model.fit(X_train_scaled, y_train)
-                            
-                            val_pred = model.predict(X_val_scaled)
-                            test_pred = model.predict(X_test_scaled)
-                            
-                            # OOF 예측 누적
-                            oof_predictions[val_idx] += val_pred / (len(CFG['SEEDS']) * len(cv_strategies) * 3 * len(models))
-                            fold_test_preds.append(test_pred)
-                            
-                        except Exception as e:
-                            print(f"    {model_name} 실패: {e}")
-                            continue
-                    
-                    if fold_test_preds:
-                        seed_test_preds.append(np.mean(fold_test_preds, axis=0))
-            
-            if seed_test_preds:
-                all_predictions.append(np.mean(seed_test_preds, axis=0))
+            all_predictions.append(seed_preds)
         
-        # 최종 앙상블
-        if all_predictions:
-            final_test_preds = np.mean(all_predictions, axis=0)
-        else:
-            final_test_preds = np.full(len(X_test_full), y_train_full.mean())
+        # 🛡️ 견고한 앙상블: 모든 시드 예측의 평균
+        final_predictions = np.mean(all_predictions, axis=0)
         
-        # 성능 평가
-        final_score, A, B, corr = self.get_leaderboard_score(y_train_full, oof_predictions)
+        # 📊 예측 스무딩 (극값 방지)
+        final_predictions = self.smooth_predictions(final_predictions)
         
-        # 무작위 80% 샘플링 시뮬레이션
-        random_scores = []
-        for _ in range(1000):
-            sample_size = int(len(y_train_full) * 0.8)
-            random_indices = np.random.choice(len(y_train_full), size=sample_size, replace=False)
-            score, _, _, _ = self.get_leaderboard_score(y_train_full.iloc[random_indices], 
-                                                       oof_predictions[random_indices])
-            random_scores.append(score)
+        print(f"✅ Word2Vec 견고 앙상블 완료! ({len(CFG['SEEDS']) * CFG['N_SPLITS']}개 모델)")
+        return final_predictions
+    
+    def smooth_predictions(self, predictions):
+        """📊 예측값 스무딩 (극값 방지)"""
+        # 1. 기본 클리핑
+        predictions = np.clip(predictions, 0, 100)
         
-        print(f"\n🏆 최종 최적화된 앙상블 성능:")
-        print(f"전체 데이터 스코어: {final_score:.4f}")
-        print(f"무작위 80% 평균: {np.mean(random_scores):.4f} ± {np.std(random_scores):.4f}")
-        print(f"무작위 80% 범위: {np.min(random_scores):.4f} ~ {np.max(random_scores):.4f}")
-        print(f"상관관계 (B): {B:.4f}")
+        # 2. 부드러운 조정 (극값 억제)
+        mean_pred = np.mean(predictions)
+        std_pred = np.std(predictions)
         
-        # 후처리
-        final_test_preds = np.clip(final_test_preds, 0, 100)
+        # 3σ 이상 극값들을 부드럽게 조정
+        upper_bound = mean_pred + 2.5 * std_pred
+        lower_bound = mean_pred - 2.5 * std_pred
         
-        return final_test_preds
+        predictions = np.where(predictions > upper_bound, 
+                              upper_bound + 0.3 * (predictions - upper_bound),
+                              predictions)
+        predictions = np.where(predictions < lower_bound,
+                              lower_bound + 0.3 * (predictions - lower_bound), 
+                              predictions)
+        
+        # 최종 클리핑
+        return np.clip(predictions, 0, 100)
+
+    def store_training_data(self, X_train, y_train):
+        """훈련 데이터 저장 (예측 시 사용)"""
+        self.X_train_stored = X_train
+        self.y_train_stored = y_train
 
 def main():
-    print("🔥 Optuna 최적화 + 무작위 80% 샘플링 견고 모델 🔥")
-    print("=" * 80)
-    print(f"🎯 Optuna 최적화: {'활성화' if CFG['ENABLE_OPTIMIZATION'] else '비활성화'}")
-    print(f"🔥 최적화 시행 수: {CFG['OPTIMIZATION_TRIALS']}")
-    print(f"⏰ 최적화 타임아웃: {CFG['OPTIMIZATION_TIMEOUT']//60}분")
-    print(f"⚡ 예상 실행 시간: {'60-90분' if CFG['ENABLE_OPTIMIZATION'] else '20-30분'}")
+    print("🤖 Word2Vec 기반 CYP3A4 예측 모델 (0.85+ 목표) 🤖")
+    print("=" * 70)
+    print("🎯 전략: Word2Vec 분자표현 + Morgan + 견고 앙상블")
+    print("🤖 SMILES Word2Vec 벡터 (300차원)")
+    print("🧬 Morgan Fingerprint + MACCS + 핵심 Descriptors")
+    print("📊 타겟 변환 (sqrt) + 다중 시드 앙상블")
+    print("🎲 무작위 80% 샘플링 대응")
+    print("⚡ 분자 시퀀스 패턴 학습으로 0.85+ 도전!")
     
     try:
         # 데이터 로드
-        print("\n데이터 로드 중...")
+        print("\n📁 데이터 로드...")
         train_df = pd.read_csv('data/train.csv')
         test_df = pd.read_csv('data/test.csv')
         sample_submission = pd.read_csv('data/sample_submission.csv')
         
-        print(f"훈련 데이터: {len(train_df)}개")
-        print(f"테스트 데이터: {len(test_df)}개")
-        print(f"0 라벨 개수: {(train_df['Inhibition'] == 0).sum()}개 (모두 유지)")
+        print(f"훈련: {len(train_df)}개, 테스트: {len(test_df)}개")
+        print(f"Inhibition 범위: {train_df['Inhibition'].min():.1f} ~ {train_df['Inhibition'].max():.1f}")
         
         # 모델 초기화
-        predictor = OptimizedRobustPredictor()
+        predictor = Word2VecCYP3A4Predictor()
         
-        # 견고한 특성 추출
-        X_train_full = predictor.prepare_robust_data(train_df, is_training=True)
-        X_test_full = predictor.prepare_robust_data(test_df, is_training=False)
-        y_train_full = train_df['Inhibition']
+        # 특성 추출
+        print("\n🔬 특성 추출...")
+        X_train, train_valid_idx = predictor.prepare_data(train_df, is_training=True)
+        X_test, test_valid_idx = predictor.prepare_data(test_df, is_training=False)
         
-        print(f"\n🚀 견고한 특성 수: {X_train_full.shape[1]:,}")
-        print(f"🛡️ 시드 개수: {len(CFG['SEEDS'])}개")
+        # 유효한 훈련 데이터만 사용
+        y_train = train_df.iloc[train_valid_idx]['Inhibition'].values
         
-        # 최적화된 앙상블 훈련
-        test_preds = predictor.train_optimized_ensemble(X_train_full, y_train_full, X_test_full)
+        print(f"✅ 최종 훈련 데이터: {X_train.shape}")
+        print(f"✅ 최종 테스트 데이터: {X_test.shape}")
+        
+        # 훈련 데이터 저장
+        predictor.store_training_data(X_train, y_train)
+        
+        # 모델 훈련
+        print("\n🎯 모델 훈련...")
+        best_score = predictor.train(X_train, y_train)
+        
+        # 예측
+        print("\n🚀 최종 예측...")
+        predictions = predictor.predict(X_test)
+        
+        # 예측 후처리 (범위 제한)
+        predictions = np.clip(predictions, 0, 100)
         
         # 제출 파일 생성
         submission = sample_submission.copy()
-        submission['Inhibition'] = test_preds
-        submission['Inhibition'] = np.clip(submission['Inhibition'], 0, 100)
+        submission.iloc[test_valid_idx, submission.columns.get_loc('Inhibition')] = predictions
         
-        submission.to_csv('submission_optimized_robust.csv', index=False)
-        print(f"\n✅ 제출 파일이 'submission_optimized_robust.csv'로 저장되었습니다.")
+        # 예측하지 못한 부분은 평균값으로 채움
+        mean_inhibition = train_df['Inhibition'].mean()
+        submission['Inhibition'].fillna(mean_inhibition, inplace=True)
         
-        print("\n🎯 최종 예측 결과 요약:")
+        # 저장
+        output_file = 'submission_word2vec.csv'
+        submission.to_csv(output_file, index=False)
+        
+        print(f"\n✅ Word2Vec 기반 제출 파일 저장: {output_file}")
+        print(f"🤖 최고 Word2Vec 스코어: {best_score:.4f}")
+        print(f"🔢 총 앙상블 모델 수: {len(CFG['SEEDS']) * CFG['N_SPLITS']}개")
+        print(f"\n📊 Word2Vec 예측 결과 요약:")
         print(submission['Inhibition'].describe())
-        print(f"\n🏆 목표: Optuna 최적화로 무작위 80% 샘플링에 견고한 최고 성능!")
-
+        
+        print(f"\n🤖 Word2Vec 기반 모델 완료!")
+        print(f"🤖 SMILES 시퀀스 패턴 학습 (300차원)")
+        print(f"🧬 Morgan + MACCS + 핵심 Descriptors 보완")
+        print(f"📊 타겟 변환으로 분포 최적화")
+        print(f"🛡️ 견고 앙상블로 안정성 유지")
+        print(f"⚡ 기대 효과: 분자 표현 혁신으로 0.85+ 달성!")
+        
     except Exception as e:
-        print(f"❌ 실행 중 오류 발생: {e}")
+        print(f"❌ 오류 발생: {e}")
         import traceback
         traceback.print_exc()
 

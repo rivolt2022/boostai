@@ -1,297 +1,335 @@
 import pandas as pd
 import numpy as np
-import os
-import random
-from rdkit import Chem
-from rdkit.Chem import AllChem, DataStructs, Descriptors, rdMolDescriptors
-from sklearn.preprocessing import StandardScaler, RobustScaler
-from sklearn.model_selection import KFold, StratifiedShuffleSplit
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-import lightgbm as lgb
-import optuna
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
+from rdkit import Chem
+from rdkit.Chem import Descriptors, rdMolDescriptors
 import warnings
-
 warnings.filterwarnings('ignore')
-
-# 전역 설정 변수들
-CFG = {
-    'NBITS': 2048,      # Morgan 지문의 비트 수
-    'SEED': 42,         # 재현성을 위한 랜덤 시드
-    'N_SPLITS': 10,     # K-폴드 교차 검증에서 사용할 폴드 수 (늘려서 안정성 확보)
-    'N_TRIALS': 50      # Optuna 하이퍼파라미터 최적화 시도 횟수 (탐색 기회 증가)
-}
-
-def seed_everything(seed):
-    """모든 랜덤 시드를 설정하여 실험의 재현성을 보장하는 함수"""
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-
-# 전역 시드 설정
-seed_everything(CFG['SEED'])
 
 class CYP3A4InhibitionPredictor:
     def __init__(self):
         self.model = None
-        self.scaler = RobustScaler() # 이상치에 강한 RobustScaler 유지
+        self.scaler = StandardScaler()
         self.feature_names = None
-        self.best_params = None
-        # RDKit에서 계산 가능한 모든 설명자 리스트
-        self.descriptor_names = [desc_name for desc_name, _ in Descriptors._descList]
-
-    def get_all_descriptors(self, mol):
-        """RDKit의 모든 분자 설명자를 계산하는 함수"""
-        desc_dict = {}
-        for name in self.descriptor_names:
+        
+    def calculate_molecular_descriptors(self, smiles_list):
+        """SMILES 문자열에서 분자 설명자 계산"""
+        descriptors = []
+        
+        for smiles in smiles_list:
             try:
-                desc_func = getattr(Descriptors, name)
-                desc_dict[name] = desc_func(mol)
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is not None:
+                    # 기본 분자 설명자들
+                    desc = {
+                        'MolWt': Descriptors.MolWt(mol),
+                        'LogP': Descriptors.MolLogP(mol),
+                        'NumHDonors': Descriptors.NumHDonors(mol),
+                        'NumHAcceptors': Descriptors.NumHAcceptors(mol),
+                        'NumRotatableBonds': Descriptors.NumRotatableBonds(mol),
+                        'TPSA': Descriptors.TPSA(mol),
+                        'NumAtoms': mol.GetNumAtoms(),
+                        'NumBonds': mol.GetNumBonds(),
+                        'NumRings': Descriptors.RingCount(mol),
+                        'NumAromaticRings': Descriptors.NumAromaticRings(mol),
+                        'FractionCsp3': Descriptors.FractionCsp3(mol),
+                        'HeavyAtomCount': Descriptors.HeavyAtomCount(mol),
+                        'NumHeteroatoms': Descriptors.NumHeteroatoms(mol),
+                        'NumSpiroAtoms': Descriptors.NumSpiroAtoms(mol),
+                        'NumBridgeheadAtoms': Descriptors.NumBridgeheadAtoms(mol),
+                        'NumAmideBonds': Descriptors.NumAmideBonds(mol),
+                        'NumAromaticHeterocycles': Descriptors.NumAromaticHeterocycles(mol),
+                        'NumSaturatedHeterocycles': Descriptors.NumSaturatedHeterocycles(mol),
+                        'NumAliphaticHeterocycles': Descriptors.NumAliphaticHeterocycles(mol),
+                        'NumAromaticCarbocycles': Descriptors.NumAromaticCarbocycles(mol),
+                        'NumSaturatedCarbocycles': Descriptors.NumSaturatedCarbocycles(mol),
+                        'NumAliphaticCarbocycles': Descriptors.NumAliphaticCarbocycles(mol),
+                        'NumStereocenters': Descriptors.NumStereocenters(mol),
+                        'NumUnspecifiedAtomStereoCenters': Descriptors.NumUnspecifiedAtomStereoCenters(mol),
+                        'NumRadicalElectrons': Descriptors.NumRadicalElectrons(mol),
+                        'NumValenceElectrons': Descriptors.NumValenceElectrons(mol),
+                        'MaxPartialCharge': Descriptors.MaxPartialCharge(mol),
+                        'MinPartialCharge': Descriptors.MinPartialCharge(mol),
+                        'MaxEStateIndex': Descriptors.MaxEStateIndex(mol),
+                        'MinEStateIndex': Descriptors.MinEStateIndex(mol),
+                        'MaxAbsEStateIndex': Descriptors.MaxAbsEStateIndex(mol),
+                        'MinAbsEStateIndex': Descriptors.MinAbsEStateIndex(mol),
+                        'qed': Descriptors.qed(mol),
+                        'MolMR': Descriptors.MolMR(mol),
+                        'ExactMolWt': Descriptors.ExactMolWt(mol),
+                        'NumHeavyAtoms': mol.GetNumHeavyAtoms(),
+                    }
+                    
+                    # 추가적인 분자 설명자들
+                    try:
+                        desc['LabuteASA'] = Descriptors.LabuteASA(mol)
+                    except:
+                        desc['LabuteASA'] = 0
+                        
+                    try:
+                        desc['PEOE_VSA'] = sum(rdMolDescriptors.PEOE_VSA_(mol))
+                    except:
+                        desc['PEOE_VSA'] = 0
+                        
+                    try:
+                        desc['SMR_VSA'] = sum(rdMolDescriptors.SMR_VSA_(mol))
+                    except:
+                        desc['SMR_VSA'] = 0
+                        
+                    try:
+                        desc['SlogP_VSA'] = sum(rdMolDescriptors.SlogP_VSA_(mol))
+                    except:
+                        desc['SlogP_VSA'] = 0
+                        
+                    try:
+                        desc['EState_VSA'] = sum(rdMolDescriptors.EState_VSA_(mol))
+                    except:
+                        desc['EState_VSA'] = 0
+                        
+                    try:
+                        desc['VSA_EState'] = sum(rdMolDescriptors.VSA_EState_(mol))
+                    except:
+                        desc['VSA_EState'] = 0
+                        
+                    descriptors.append(desc)
+                else:
+                    # SMILES 파싱 실패 시 기본값으로 채움
+                    descriptors.append({key: 0 for key in [
+                        'MolWt', 'LogP', 'NumHDonors', 'NumHAcceptors', 'NumRotatableBonds',
+                        'TPSA', 'NumAtoms', 'NumBonds', 'NumRings', 'NumAromaticRings',
+                        'FractionCsp3', 'HeavyAtomCount', 'NumHeteroatoms', 'NumSpiroAtoms',
+                        'NumBridgeheadAtoms', 'NumAmideBonds', 'NumAromaticHeterocycles',
+                        'NumSaturatedHeterocycles', 'NumAliphaticHeterocycles',
+                        'NumAromaticCarbocycles', 'NumSaturatedCarbocycles',
+                        'NumAliphaticCarbocycles', 'NumStereocenters',
+                        'NumUnspecifiedAtomStereoCenters', 'NumRadicalElectrons',
+                        'NumValenceElectrons', 'MaxPartialCharge', 'MinPartialCharge',
+                        'MaxEStateIndex', 'MinEStateIndex', 'MaxAbsEStateIndex',
+                        'MinAbsEStateIndex', 'qed', 'MolMR', 'ExactMolWt', 'NumHeavyAtoms',
+                        'LabuteASA', 'PEOE_VSA', 'SMR_VSA', 'SlogP_VSA', 'EState_VSA', 'VSA_EState'
+                    ]})
             except:
-                # 계산 실패 시 0으로 채움
-                desc_dict[name] = 0
-        return desc_dict
-
-    def smiles_to_features(self, smiles):
-        """SMILES 문자열에서 Morgan 지문, MACCS 키, 분자 설명자를 추출하는 함수"""
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return None, None, None
-
-        # 1. Morgan Fingerprint
-        fp_morgan = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=CFG['NBITS'])
-        arr_morgan = np.zeros((1,))
-        DataStructs.ConvertToNumpyArray(fp_morgan, arr_morgan)
-
-        # 2. MACCS Keys
-        fp_maccs = AllChem.GetMACCSKeysFingerprint(mol)
-        arr_maccs = np.zeros((1,))
-        DataStructs.ConvertToNumpyArray(fp_maccs, arr_maccs)
-
-        # 3. RDKit Descriptors
-        descriptors = self.get_all_descriptors(mol)
-
-        return arr_morgan, arr_maccs, descriptors
-
-    def prepare_data(self, df):
-        """데이터프레임에서 모든 특성을 병렬로 추출"""
-        print("분자 특성 추출 중 (Morgan, MACCS, RDKit Descriptors)...")
+                # 예외 발생 시 기본값으로 채움
+                descriptors.append({key: 0 for key in [
+                    'MolWt', 'LogP', 'NumHDonors', 'NumHAcceptors', 'NumRotatableBonds',
+                    'TPSA', 'NumAtoms', 'NumBonds', 'NumRings', 'NumAromaticRings',
+                    'FractionCsp3', 'HeavyAtomCount', 'NumHeteroatoms', 'NumSpiroAtoms',
+                    'NumBridgeheadAtoms', 'NumAmideBonds', 'NumAromaticHeterocycles',
+                    'NumSaturatedHeterocycles', 'NumAliphaticHeterocycles',
+                    'NumAromaticCarbocycles', 'NumSaturatedCarbocycles',
+                    'NumAliphaticCarbocycles', 'NumStereocenters',
+                    'NumUnspecifiedAtomStereoCenters', 'NumRadicalElectrons',
+                    'NumValenceElectrons', 'MaxPartialCharge', 'MinPartialCharge',
+                    'MaxEStateIndex', 'MinEStateIndex', 'MaxAbsEStateIndex',
+                    'MinAbsEStateIndex', 'qed', 'MolMR', 'ExactMolWt', 'NumHeavyAtoms',
+                    'LabuteASA', 'PEOE_VSA', 'SMR_VSA', 'SlogP_VSA', 'EState_VSA', 'VSA_EState'
+                ]})
         
-        all_features = []
-        for i, smiles in enumerate(df['Canonical_Smiles']):
-            if i % 200 == 0:
-                print(f"처리 중: {i}/{len(df)}")
-            
-            morgan_fp, maccs_fp, descriptors = self.smiles_to_features(smiles)
-            
-            if morgan_fp is None:
-                # SMILES 파싱 실패 시
-                morgan_fp = np.zeros(CFG['NBITS'])
-                maccs_fp = np.zeros(167) # MACCS 키는 167 비트
-                descriptors = {name: 0 for name in self.descriptor_names}
-
-            all_features.append((morgan_fp, maccs_fp, list(descriptors.values())))
-
-        # 특성별로 분리
-        morgan_fps = np.array([item[0] for item in all_features])
-        maccs_fps = np.array([item[1] for item in all_features])
-        desc_df = pd.DataFrame([item[2] for item in all_features], columns=self.descriptor_names)
-
-        # 특성 이름 저장 (나중에 특성 중요도 시각화를 위해)
-        morgan_names = [f'Morgan_{i}' for i in range(CFG['NBITS'])]
-        maccs_names = [f'MACCS_{i}' for i in range(maccs_fps.shape[1])]
-        self.feature_names = morgan_names + maccs_names + self.descriptor_names
+        return pd.DataFrame(descriptors)
+    
+    def prepare_data(self, train_data, test_data=None):
+        """데이터 준비 및 특성 추출"""
+        print("훈련 데이터에서 분자 설명자 계산 중...")
+        train_features = self.calculate_molecular_descriptors(train_data['Canonical_Smiles'])
         
-        # 모든 특성을 하나의 numpy 배열로 결합
-        return np.hstack([morgan_fps, maccs_fps, desc_df.values])
-
-    def get_score(self, y_true, y_pred):
-        """커스텀 스코어 함수"""
-        mse = mean_squared_error(y_true, y_pred)
-        rmse = np.sqrt(mse)
-        # y_true의 범위가 0~100으로 고정되어 있으므로 분모를 상수로 사용 가능
-        nrmse = rmse / (100 - 0) 
-        A = 1 - min(nrmse, 1)
-        B = r2_score(y_true, y_pred)
-        score = 0.4 * A + 0.6 * B
-        return score
-
-    def objective(self, trial, X, y):
-        """Optuna 목적 함수"""
-        params = {
-            'objective': 'regression_l1', # MAE objective, 이상치에 더 강함
-            'metric': 'rmse',
-            'verbose': -1,
-            'n_jobs': -1,
-            'seed': CFG['SEED'],
-            'boosting_type': 'gbdt',
-            'n_estimators': trial.suggest_int('n_estimators', 500, 2000),
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.05),
-            'num_leaves': trial.suggest_int('num_leaves', 20, 60),
-            'max_depth': trial.suggest_int('max_depth', 5, 12),
-            'feature_fraction': trial.suggest_float('feature_fraction', 0.5, 0.9),
-            'bagging_fraction': trial.suggest_float('bagging_fraction', 0.5, 0.9),
-            'bagging_freq': trial.suggest_int('bagging_freq', 1, 7),
-            'min_child_samples': trial.suggest_int('min_child_samples', 5, 30),
-            'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 10.0, log=True),
-            'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 10.0, log=True),
+        if test_data is not None:
+            print("테스트 데이터에서 분자 설명자 계산 중...")
+            test_features = self.calculate_molecular_descriptors(test_data['Canonical_Smiles'])
+            return train_features, test_features
+        
+        return train_features
+    
+    def train(self, X_train, y_train):
+        """모델 훈련"""
+        print("모델 훈련 중...")
+        
+        # 여러 모델 시도
+        models = {
+            'RandomForest': RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1),
+            'GradientBoosting': GradientBoostingRegressor(n_estimators=200, random_state=42)
         }
-
-        kf = KFold(n_splits=CFG['N_SPLITS'], shuffle=True, random_state=CFG['SEED'])
-        oof_preds = np.zeros(len(X))
-        y_array = y.values if hasattr(y, 'values') else np.array(y)
-
-        for train_idx, val_idx in kf.split(X, y_array):
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y_array[train_idx], y_array[val_idx]
-
-            # 데이터 스케일링
-            scaler = RobustScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_val_scaled = scaler.transform(X_val)
-
-            model = lgb.LGBMRegressor(**params)
-            model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)],
-                      eval_metric='rmse', callbacks=[lgb.early_stopping(100, verbose=False)])
+        
+        best_score = -np.inf
+        best_model = None
+        best_model_name = None
+        
+        for name, model in models.items():
+            print(f"{name} 모델 훈련 중...")
+            scores = cross_val_score(model, X_train, y_train, cv=5, scoring='r2')
+            mean_score = scores.mean()
+            print(f"{name} CV R² Score: {mean_score:.4f} (+/- {scores.std() * 2:.4f})")
             
-            oof_preds[val_idx] = model.predict(X_val_scaled)
-
-        score = self.get_score(y_array, oof_preds)
-        return score
-
-    def train_and_predict(self, X_train_full, y_train_full, X_test_full):
-        """모델 훈련 및 테스트 데이터 예측"""
-        print("하이퍼파라미터 최적화 중...")
-        study = optuna.create_study(direction='maximize', study_name='lgbm_tuning')
-        study.optimize(lambda trial: self.objective(trial, X_train_full, y_train_full), n_trials=CFG['N_TRIALS'])
-
-        print(f"최적화 완료. 최고 스코어: {study.best_value:.4f}")
-        self.best_params = study.best_params
-        print("최적 파라미터:", self.best_params)
-
-        # K-Fold 앙상블 훈련 및 예측
-        print("\n앙상블 예측을 위한 K-폴드 훈련 중...")
-        kf = KFold(n_splits=CFG['N_SPLITS'], shuffle=True, random_state=CFG['SEED'])
-        test_preds = np.zeros(len(X_test_full))
-        oof_preds = np.zeros(len(X_train_full))
+            if mean_score > best_score:
+                best_score = mean_score
+                best_model = model
+                best_model_name = name
         
-        final_model_params = {
-            'objective': 'regression_l1',
-            'metric': 'rmse', 'verbose': -1, 'n_jobs': -1,
-            'seed': CFG['SEED'], 'boosting_type': 'gbdt'
-        }
-        final_model_params.update(self.best_params)
-
-        models = [] # 특성 중요도 시각화를 위해 모델 저장
-
-        for fold, (train_idx, val_idx) in enumerate(kf.split(X_train_full, y_train_full)):
-            print(f"--- 훈련 폴드 {fold+1}/{CFG['N_SPLITS']} ---")
-            X_train, X_val = X_train_full[train_idx], X_train_full[val_idx]
-            y_train, y_val = y_train_full.iloc[train_idx], y_train_full.iloc[val_idx]
-
-            # ❗ 중요: 폴드마다 스케일러를 새로 fit_transform 해야 데이터 누수를 막을 수 있음
-            scaler = RobustScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_val_scaled = scaler.transform(X_val)
-            X_test_scaled = scaler.transform(X_test_full)
-
-            model = lgb.LGBMRegressor(**final_model_params)
-            model.fit(X_train_scaled, y_train, eval_set=[(X_val_scaled, y_val)],
-                      eval_metric='rmse', callbacks=[lgb.early_stopping(100, verbose=False)])
-
-            oof_preds[val_idx] = model.predict(X_val_scaled)
-            test_preds += model.predict(X_test_scaled) / CFG['N_SPLITS']
-            models.append(model)
+        print(f"\n최적 모델: {best_model_name}")
         
-        self.model = models # 마지막 폴드의 모델을 대표로 저장 (혹은 평균 모델)
+        # 최적 모델로 전체 데이터 훈련
+        self.model = best_model
+        self.model.fit(X_train, y_train)
         
-        # OOF 예측 결과로 전체 훈련 데이터에 대한 성능 평가
-        final_score = self.get_score(y_train_full, oof_preds)
-        print(f"\nK-Fold OOF Custom Score: {final_score:.4f}")
+        # 훈련 성능 평가
+        y_pred = self.model.predict(X_train)
+        train_r2 = r2_score(y_train, y_pred)
+        train_rmse = np.sqrt(mean_squared_error(y_train, y_pred))
+        train_mae = mean_absolute_error(y_train, y_pred)
         
-        self.plot_results(y_train_full, oof_preds, "K-Fold OOF Predictions")
-
-        return test_preds
-
+        print(f"\n훈련 성능:")
+        print(f"R² Score: {train_r2:.4f}")
+        print(f"RMSE: {train_rmse:.4f}")
+        print(f"MAE: {train_mae:.4f}")
+        
+        return self.model
+    
+    def predict(self, X):
+        """예측 수행"""
+        if self.model is None:
+            raise ValueError("모델이 훈련되지 않았습니다. train() 메서드를 먼저 호출하세요.")
+        return self.model.predict(X)
+    
+    def evaluate(self, X_test, y_test):
+        """모델 평가"""
+        y_pred = self.predict(X_test)
+        
+        r2 = r2_score(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        mae = mean_absolute_error(y_test, y_pred)
+        
+        print(f"\n테스트 성능:")
+        print(f"R² Score: {r2:.4f}")
+        print(f"RMSE: {rmse:.4f}")
+        print(f"MAE: {mae:.4f}")
+        
+        return r2, rmse, mae
+    
     def plot_results(self, y_true, y_pred, title="예측 vs 실제"):
         """결과 시각화"""
-        plt.figure(figsize=(14, 8))
-        plt.rcParams['font.family'] = 'Malgun Gothic' # 한글 폰트 설정
-        plt.rcParams['axes.unicode_minus'] = False # 마이너스 깨짐 방지
+        plt.figure(figsize=(10, 8))
         
         # 산점도
         plt.subplot(2, 2, 1)
-        sns.regplot(x=y_true, y=y_pred, scatter_kws={'alpha':0.4, 'color': 'royalblue'}, line_kws={'color':'red', 'linestyle':'--'})
-        plt.xlabel('실제 값 (Inhibition %)')
-        plt.ylabel('예측 값 (Inhibition %)')
+        plt.scatter(y_true, y_pred, alpha=0.6)
+        plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--', lw=2)
+        plt.xlabel('실제 값')
+        plt.ylabel('예측 값')
         plt.title(f'{title}\nR² = {r2_score(y_true, y_pred):.4f}')
         
         # 잔차 플롯
         plt.subplot(2, 2, 2)
         residuals = y_true - y_pred
-        sns.scatterplot(x=y_pred, y=residuals, alpha=0.5, color='forestgreen')
+        plt.scatter(y_pred, residuals, alpha=0.6)
         plt.axhline(y=0, color='r', linestyle='--')
         plt.xlabel('예측 값')
         plt.ylabel('잔차')
         plt.title('잔차 플롯')
         
-        # 특성 중요도
-        plt.subplot(2, 1, 2)
-        if self.model and self.feature_names:
-            # 모든 폴드의 특성 중요도를 평균내어 사용
-            importances = np.mean([m.feature_importances_ for m in self.model], axis=0)
-            feature_importance_df = pd.DataFrame({
+        # 히스토그램
+        plt.subplot(2, 2, 3)
+        plt.hist(residuals, bins=30, alpha=0.7)
+        plt.xlabel('잔차')
+        plt.ylabel('빈도')
+        plt.title('잔차 분포')
+        
+        # 특성 중요도 (RandomForest인 경우)
+        if hasattr(self.model, 'feature_importances_'):
+            plt.subplot(2, 2, 4)
+            feature_importance = pd.DataFrame({
                 'feature': self.feature_names,
-                'importance': importances
-            }).sort_values('importance', ascending=False).head(20)
+                'importance': self.model.feature_importances_
+            }).sort_values('importance', ascending=False).head(15)
             
-            sns.barplot(x='importance', y='feature', data=feature_importance_df)
-            plt.title('상위 20개 특성 중요도 (K-Fold 평균)')
+            plt.barh(range(len(feature_importance)), feature_importance['importance'])
+            plt.yticks(range(len(feature_importance)), feature_importance['feature'])
+            plt.xlabel('특성 중요도')
+            plt.title('상위 15개 특성 중요도')
         
         plt.tight_layout()
-        plt.savefig('model_results_improved.png', dpi=300, bbox_inches='tight')
         plt.show()
 
 def main():
-    print("🚀 CYP3A4 효소 저해 예측 모델 개선 시작 🚀")
-    print("=" * 70)
+    print("CYP3A4 효소 저해 예측 모델 개발")
+    print("=" * 50)
     
-    try:
-        # 데이터 로드
-        print("데이터 로드 중...")
-        train_df = pd.read_csv('data/train.csv')
-        test_df = pd.read_csv('data/test.csv')
-        sample_submission = pd.read_csv('data/sample_submission.csv')
-        
-        # 모델 초기화
-        predictor = CYP3A4InhibitionPredictor()
-        
-        # 특성 추출
-        X_train_full = predictor.prepare_data(train_df)
-        X_test_full = predictor.prepare_data(test_df)
-        y_train_full = train_df['Inhibition']
-        
-        print(f"\n최종 특성 수: {X_train_full.shape[1]}")
-        
-        # 모델 훈련 및 예측
-        test_preds = predictor.train_and_predict(X_train_full, y_train_full, X_test_full)
-        
-        # 제출 파일 생성
-        submission = sample_submission.copy()
-        submission['Inhibition'] = test_preds
-        submission['Inhibition'] = np.clip(submission['Inhibition'], 0, 100)
-        
-        submission.to_csv('submission_improved.csv', index=False)
-        print(f"\n✅ 제출 파일이 'submission_improved.csv'로 저장되었습니다.")
-        
-        print("\n예측 결과 요약:")
-        print(submission['Inhibition'].describe())
-
-    except Exception as e:
-        print(f"❌ 실행 중 오류 발생: {e}")
-        import traceback
-        traceback.print_exc()
+    # 데이터 로드
+    print("데이터 로드 중...")
+    train_data = pd.read_csv('data/train.csv')
+    test_data = pd.read_csv('data/test.csv')
+    sample_submission = pd.read_csv('data/sample_submission.csv')
+    
+    print(f"훈련 데이터: {train_data.shape}")
+    print(f"테스트 데이터: {test_data.shape}")
+    print(f"샘플 제출 파일: {sample_submission.shape}")
+    
+    # 데이터 기본 정보
+    print("\n훈련 데이터 정보:")
+    print(train_data.info())
+    print(f"\n저해율 통계:")
+    print(train_data['Inhibition'].describe())
+    
+    # 모델 초기화
+    predictor = CYP3A4InhibitionPredictor()
+    
+    # 특성 추출
+    train_features, test_features = predictor.prepare_data(train_data, test_data)
+    predictor.feature_names = train_features.columns.tolist()
+    
+    print(f"\n추출된 특성 수: {len(predictor.feature_names)}")
+    print("주요 특성들:", predictor.feature_names[:10])
+    
+    # 데이터 분할
+    X_train, X_val, y_train, y_val = train_test_split(
+        train_features, train_data['Inhibition'], 
+        test_size=0.2, random_state=42
+    )
+    
+    print(f"\n훈련 세트: {X_train.shape}")
+    print(f"검증 세트: {X_val.shape}")
+    
+    # 모델 훈련
+    predictor.train(X_train, y_train)
+    
+    # 검증 세트에서 평가
+    val_r2, val_rmse, val_mae = predictor.evaluate(X_val, y_val)
+    
+    # 결과 시각화
+    y_val_pred = predictor.predict(X_val)
+    predictor.plot_results(y_val, y_val_pred, "검증 세트 예측 결과")
+    
+    # 테스트 데이터 예측
+    print("\n테스트 데이터 예측 중...")
+    test_predictions = predictor.predict(test_features)
+    
+    # 제출 파일 생성
+    submission = sample_submission.copy()
+    submission['Inhibition'] = test_predictions
+    
+    # 예측값 범위 조정 (0-100% 범위로)
+    submission['Inhibition'] = np.clip(submission['Inhibition'], 0, 100)
+    
+    # 제출 파일 저장
+    submission.to_csv('submission.csv', index=False)
+    print(f"\n제출 파일이 'submission.csv'로 저장되었습니다.")
+    
+    # 예측 결과 요약
+    print(f"\n예측 결과 요약:")
+    print(f"평균 예측 저해율: {submission['Inhibition'].mean():.2f}%")
+    print(f"최소 예측 저해율: {submission['Inhibition'].min():.2f}%")
+    print(f"최대 예측 저해율: {submission['Inhibition'].max():.2f}%")
+    
+    # 상위 예측값들
+    print(f"\n상위 10개 예측값:")
+    top_predictions = submission.nlargest(10, 'Inhibition')
+    for idx, row in top_predictions.iterrows():
+        print(f"{row['ID']}: {row['Inhibition']:.2f}%")
+    
+    return predictor, submission
 
 if __name__ == "__main__":
-    main()
+    model, submission = main()
