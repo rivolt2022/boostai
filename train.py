@@ -376,5 +376,107 @@ if __name__ == "__main__":
         print(f"Inhibition 범위: {submission_df['Inhibition'].min():.2f}% ~ {submission_df['Inhibition'].max():.2f}%")
         print(f"평균 Inhibition: {submission_df['Inhibition'].mean():.2f}%")
         print(f"중앙값 Inhibition: {submission_df['Inhibition'].median():.2f}%")
+
+        # === 6. 예상 스코어 계산 및 출력 ===
+        print("\n=== 6. 예상 스코어 계산 (test.csv를 실제 리더보드 데이터로 가정) ===")
+        
+        # test.csv에 실제 정답값이 있다고 가정하고 스코어 계산
+        # 실제로는 test.csv에 'Inhibition' 컬럼이 없으므로, 
+        # 훈련 데이터의 분포를 기반으로 시뮬레이션하거나
+        # 또는 실제 정답값이 있다고 가정하고 계산
+        
+        try:
+            # 방법 1: test.csv에 실제 정답값이 있다고 가정
+            if 'Inhibition' in test_df.columns:
+                # 실제 정답값이 있는 경우
+                y_test_true = test_df.loc[valid_test_mask, 'Inhibition'].values
+                expected_score = get_score(y_test_true, final_preds)
+                print(f" 예상 스코어 (실제 정답 기반): {expected_score:.4f}")
+                
+                # 목표 점수와 비교
+                target_score = 0.85
+                if expected_score >= target_score:
+                    print(f"✅ 목표 점수 {target_score} 달성! (차이: +{expected_score - target_score:.4f})")
+                else:
+                    print(f"❌ 목표 점수 {target_score} 미달성 (차이: {expected_score - target_score:.4f})")
+                    
+            else:
+                # 방법 2: 훈련 데이터 기반으로 예상 스코어 시뮬레이션
+                print("📊 test.csv에 정답값이 없으므로 훈련 데이터 기반으로 예상 스코어를 계산합니다...")
+                
+                # 훈련 데이터에서 교차 검증 스코어 계산
+                print("\n--- 교차 검증 스코어 계산 ---")
+                cv_scores = []
+                
+                # 시드 앙상블의 각 시드별로 교차 검증 스코어 계산
+                for seed in CFG['SEEDS']:
+                    print(f"\n--- 시드 {seed} 교차 검증 ---")
+                    seed_everything(seed)
+                    best_params['seed'] = seed
+                    
+                    kf = KFold(n_splits=CFG['N_SPLITS'], shuffle=True, random_state=seed)
+                    oof_preds = np.zeros(len(X))
+                    
+                    for fold, (train_idx, val_idx) in enumerate(kf.split(X, y)):
+                        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+                        y_train, y_val = y[train_idx], y[val_idx]
+                        
+                        model = lgb.LGBMRegressor(**best_params)
+                        model.fit(X_train, y_train, 
+                                eval_set=[(X_val, y_val)],
+                                eval_metric=lgbm_score_metric,
+                                callbacks=[lgb.early_stopping(100, verbose=False)])
+                        
+                        oof_preds[val_idx] = np.clip(model.predict(X_val), 0, 100)
+                    
+                    # 현재 시드의 교차 검증 스코어 계산
+                    cv_score = get_score(y, oof_preds)
+                    cv_scores.append(cv_score)
+                    print(f"시드 {seed} CV 스코어: {cv_score:.4f}")
+                
+                # 전체 시드의 평균 교차 검증 스코어
+                mean_cv_score = np.mean(cv_scores)
+                std_cv_score = np.std(cv_scores)
+                
+                print(f"\n📈 교차 검증 결과:")
+                print(f"평균 CV 스코어: {mean_cv_score:.4f} ± {std_cv_score:.4f}")
+                print(f"최고 CV 스코어: {np.max(cv_scores):.4f}")
+                print(f"최저 CV 스코어: {np.min(cv_scores):.4f}")
+                
+                # 목표 점수와 비교
+                target_score = 0.85
+                if mean_cv_score >= target_score:
+                    print(f"✅ 목표 점수 {target_score} 달성 가능성 높음!")
+                    print(f"   (평균 CV 스코어: {mean_cv_score:.4f})")
+                else:
+                    print(f"⚠️  목표 점수 {target_score} 달성에 도전적")
+                    print(f"   (평균 CV 스코어: {mean_cv_score:.4f}, 차이: {mean_cv_score - target_score:.4f})")
+                
+                # 성능 개선 제안
+                print(f"\n💡 성능 개선 제안:")
+                if mean_cv_score < 0.80:
+                    print("   - 더 많은 사전 훈련 모델 앙상블 고려")
+                    print("   - 추가적인 분자 설명자 활용")
+                    print("   - 하이퍼파라미터 탐색 범위 확대")
+                elif mean_cv_score < 0.85:
+                    print("   - 시드 앙상블 수 증가")
+                    print("   - 더 정교한 하이퍼파라미터 튜닝")
+                    print("   - 특징 선택 기법 적용")
+                else:
+                    print("   - 현재 모델이 목표 성능을 충족합니다!")
+                
+                # 예상 리더보드 스코어 (교차 검증 스코어에 약간의 보수적 조정)
+                expected_leaderboard_score = mean_cv_score - 0.02  # 보수적 추정
+                print(f"\n🎯 예상 리더보드 스코어: {expected_leaderboard_score:.4f}")
+                print(f"   (CV 스코어에서 0.02를 뺀 보수적 추정)")
+                
+        except Exception as e:
+            print(f"스코어 계산 중 오류 발생: {e}")
+            print("기본 통계 정보만 출력합니다.")
+        
+        print(f"\n{'='*60}")
+        print("🎉 모델 훈련 및 예측 완료!")
+        print(f"{'='*60}")
+        
     else:
         print("데이터 로드 실패. 파일 경로를 확인하세요.")
