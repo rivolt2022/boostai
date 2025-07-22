@@ -20,6 +20,10 @@ from scipy.stats import pearsonr                 # 두 변수 간의 피어슨 �
 import lightgbm as lgb                           # 빠르고 효율적인 그래디언트 부스팅 머신러닝 모델
 import optuna                                    # 하이퍼파라미터 최적화를 자동화하는 라이브러리
 
+# --- 신경망 모델 및 라이브러리 추가 ---
+import torch
+from transformers import AutoTokenizer, AutoModel
+
 # --- 전역 설정 (Global Configuration) ---
 # 실험의 주요 파라미터들을 코드 상단에 모아두어 관리하기 쉽게 함
 CFG = {
@@ -27,7 +31,8 @@ CFG = {
     'FP_RADIUS': 3,     # Morgan Fingerprint 계산 시 고려할 원자의 반경. 클수록 더 넓은 구조 정보를 포함.
     'SEEDS': [42, 2024, 101, 7, 99], # 시드 앙상블에 사용할 여러 개의 랜덤 시드 목록
     'N_SPLITS': 10,     # K-Fold 교차 검증 시 데이터를 나눌 폴드(Fold)의 수
-    'N_TRIALS': 100     # Optuna가 하이퍼파라미터 최적화를 위해 시도할 횟수
+    'N_TRIALS': 50,     # Optuna가 하이퍼파라미터 최적화를 위해 시도할 횟수 (시간 관계상 축소)
+    'CHEMBERTA_MODEL': 'seyonec/ChemBERTa-zinc-base-v1' # 사용할 사전 훈련 모델
 }
 
 # --- 함수 정의 ---
@@ -57,6 +62,32 @@ def load_data():
         # 파일이 없을 경우 에러 메시지를 출력하고 프로그램을 안전하게 종료
         print(f"오류: {e}. 'data' 디렉토리에 파일이 있는지 확인하세요.")
         return None, None
+
+def get_chemberta_embeddings(smiles_list, model_name, batch_size=32):
+    """
+    SMILES 리스트로부터 사전 훈련된 ChemBERTa 모델을 사용하여 임베딩을 추출하는 함수.
+    """
+    print(f"'{model_name}' 모델을 사용하여 임베딩 추출 중...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+
+    all_embeddings = []
+    with torch.no_grad():
+        for i in range(0, len(smiles_list), batch_size):
+            batch_smiles = smiles_list[i:i+batch_size]
+            inputs = tokenizer(batch_smiles, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+            outputs = model(**inputs)
+            # [CLS] 토큰의 임베딩을 사용 (분자 전체의 대표 벡터)
+            cls_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+            all_embeddings.extend(cls_embeddings)
+            if (i // batch_size) % 10 == 0:
+                print(f"  {i+len(batch_smiles)} / {len(smiles_list)} 처리 완료...")
+
+    print("임베딩 추출 완료.")
+    return np.array(all_embeddings)
 
 def smiles_to_fingerprint(smiles):
     """
@@ -194,15 +225,19 @@ if __name__ == "__main__":
         # 분자 구조(SMILES)로부터 모델이 학습할 수 있는 유의미한 숫자 형태의 특징들을 추출하고 가공하는 과정
         print("\n2. 특징 공학(Feature Engineering)...")
         
-        # Morgan Fingerprint 특징 추출
-        train_df['fingerprint'] = train_df['Canonical_Smiles'].apply(smiles_to_fingerprint)
-        # RDKit 분자 설명자 특징 추출
+        # --- 2a. ChemBERTa 임베딩 추출 ---
+        train_embeddings = get_chemberta_embeddings(train_df['Canonical_Smiles'].tolist(), CFG['CHEMBERTA_MODEL'])
+        embedding_feature_names = [f"emb_{i}" for i in range(train_embeddings.shape[1])]
+        embedding_df = pd.DataFrame(train_embeddings, columns=embedding_feature_names, index=train_df.index)
+
+        # --- 2b. RDKit 분자 설명자 특징 추출 ---
         train_df['descriptors'] = train_df['Canonical_Smiles'].apply(calculate_rdkit_descriptors)
-        # 특징 추출 과정에서 실패한 행(결측치, NaN)이 있다면 제거
-        train_df.dropna(subset=['fingerprint', 'descriptors'], inplace=True)
+        
+        # 임베딩과 설명자 특징 결합
+        train_df = pd.concat([train_df, embedding_df], axis=1)
+        train_df.dropna(subset=['descriptors'], inplace=True) # 설명자 계산 실패한 경우 제외
 
         # 특징들을 수평으로 결합하기 위해 NumPy 배열 형태로 변환
-        fp_stack = np.stack(train_df['fingerprint'].values)
         desc_stack = np.stack(train_df['descriptors'].values)
         
         # 분자 설명자의 결측값(NaN) 처리
@@ -218,15 +253,15 @@ if __name__ == "__main__":
         desc_scaled = scaler.fit_transform(desc_stack)
         
         # === 최종 훈련 데이터셋(X, y) 생성 ===
-        # Morgan Fingerprint와 정규화된 분자 설명자를 수평으로 결합하여 최종 특징 행렬(X) 생성
-        X = np.hstack([fp_stack, desc_scaled])
+        # ChemBERTa 임베딩과 정규화된 분자 설명자를 수평으로 결합하여 최종 특징 행렬(X) 생성
+        embedding_features = train_df[embedding_feature_names].values
+        X = np.hstack([embedding_features, desc_scaled])
         # 예측해야 할 목표 변수(y)를 'Inhibition' 컬럼으로 지정
         y = train_df['Inhibition'].values
 
         # 특징 이름 생성 (LightGBM 실행 시 발생하는 경고 메시지를 방지하고, 나중에 특징 중요도 분석을 용이하게 함)
-        fp_feature_names = [f"fp_{i}" for i in range(CFG['NBITS'])]
         desc_feature_names = [name for name, _ in Descriptors._descList]
-        all_feature_names = fp_feature_names + desc_feature_names
+        all_feature_names = embedding_feature_names + desc_feature_names
         # 숫자만 있던 NumPy 배열을 특징 이름이 있는 Pandas DataFrame으로 변환
         X = pd.DataFrame(X, columns=all_feature_names)
 
@@ -255,21 +290,30 @@ if __name__ == "__main__":
         print("\n4. 시드 앙상블을 사용한 최종 모델 훈련 및 예측...")
         
         # --- 테스트 데이터에 대해서도 훈련 데이터와 '동일한' 특징 공학 과정 수행 ---
-        test_df['fingerprint'] = test_df['Canonical_Smiles'].apply(smiles_to_fingerprint)
+        # --- 4a. ChemBERTa 임베딩 추출 ---
+        test_embeddings = get_chemberta_embeddings(test_df['Canonical_Smiles'].tolist(), CFG['CHEMBERTA_MODEL'])
+        test_embedding_df = pd.DataFrame(test_embeddings, columns=embedding_feature_names, index=test_df.index)
+
+        # --- 4b. RDKit 분자 설명자 특징 추출 ---
         test_df['descriptors'] = test_df['Canonical_Smiles'].apply(calculate_rdkit_descriptors)
         
-        # 특징 추출에 성공한 유효한 테스트 데이터만 선택
-        valid_test_mask = test_df['fingerprint'].notna()
+        # 임베딩과 설명자 특징 결합
+        test_df = pd.concat([test_df, test_embedding_df], axis=1)
+
+        # 특징 추출에 성공한 유효한 테스트 데이터만 선택 (임베딩은 항상 성공한다고 가정)
+        valid_test_mask = test_df['descriptors'].notna()
+        
         # 특징들을 NumPy 배열로 변환
-        fp_test_stack = np.stack(test_df.loc[valid_test_mask, 'fingerprint'].values)
+        embedding_test_features = test_df.loc[valid_test_mask, embedding_feature_names].values
         desc_test_stack = np.stack(test_df.loc[valid_test_mask, 'descriptors'].values)
+        
         # 결측값 처리 (중요: 테스트 데이터의 평균이 아닌, '훈련 데이터'에서 계산한 평균(desc_mean)으로 채워야 함)
         desc_test_stack = np.nan_to_num(desc_test_stack, nan=desc_mean)
         # 정규화 (중요: 테스트 데이터로 새로 학습하는 것이 아닌, '훈련 데이터'로 학습된 스케일러(scaler)를 그대로 사용)
         desc_test_scaled = scaler.transform(desc_test_stack)
         
         # 최종 테스트 데이터셋(X_test) 생성
-        X_test = np.hstack([fp_test_stack, desc_test_scaled])
+        X_test = np.hstack([embedding_test_features, desc_test_scaled])
         X_test = pd.DataFrame(X_test, columns=all_feature_names)
 
         # 시드 앙상블의 전체 예측값을 저장할 배열 초기화
