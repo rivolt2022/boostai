@@ -1,482 +1,288 @@
-# --- 라이브러리 임포트 ---
-# 데이터 분석 및 처리를 위한 필수 라이브러리
-import pandas as pd  # 데이터프레임(표 형태의 데이터)을 다루기 위한 라이브러리
-import numpy as np   # 수치 계산, 특히 배열(행렬) 연산을 위한 라이브러리
+# 필요한 라이브러리들을 임포트
+import pandas as pd
+import numpy as np
+import os
+import random
+from rdkit import Chem
+from rdkit.Chem import AllChem, DataStructs, Descriptors
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import KFold, StratifiedKFold
+import lightgbm as lgb
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import optuna
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
 
-# 파이썬 기본 내장 라이브러리
-import os            # 운영체제와 상호작용하기 위한 라이브러리 (예: 환경 변수 설정)
-import random        # 무작위 수를 생성하기 위한 라이브러리
-from pathlib import Path  # 파일 및 디렉토리 경로를 객체 지향적으로 다루기 위한 라이브러리
-
-# 화학 정보학 및 특징 공학을 위한 라이브러리
-from rdkit import Chem  # 분자 구조를 다루고 화학 계산을 수행하기 위한 핵심 라이브러리
-from rdkit.Chem import AllChem, DataStructs, Descriptors  # Morgan Fingerprint, 분자 설명자 등 계산 기능
-
-# 머신러닝 모델링 및 평가를 위한 라이브러리
-from sklearn.preprocessing import StandardScaler   # 데이터의 스케일을 조정(정규화)하기 위한 도구
-from sklearn.model_selection import KFold          # 교차 검증을 위해 데이터를 여러 부분으로 나누는 도구
-from sklearn.metrics import mean_squared_error   # 모델의 예측 오차(MSE)를 계산하는 함수
-from scipy.stats import pearsonr                 # 두 변수 간의 피어슨 상관 계수를 계산하는 함수
-import lightgbm as lgb                           # 빠르고 효율적인 그래디언트 부스팅 머신러닝 모델
-import optuna                                    # 하이퍼파라미터 최적화를 자동화하는 라이브러리
-
-# --- 신경망 모델 및 라이브러리 추가 ---
-import torch
-from transformers import AutoTokenizer, AutoModel
-
-# --- 전역 설정 (Global Configuration) ---
-# 실험의 주요 파라미터들을 코드 상단에 모아두어 관리하기 쉽게 함
+# 전역 설정 변수들
 CFG = {
-    'NBITS': 2048,      # Morgan Fingerprint를 생성할 때 사용할 비트(차원)의 수
-    'FP_RADIUS': 3,     # Morgan Fingerprint 계산 시 고려할 원자의 반경. 클수록 더 넓은 구조 정보를 포함.
-    'SEEDS': [42, 2024, 101, 7, 99], # 시드 앙상블에 사용할 여러 개의 랜덤 시드 목록
-    'N_SPLITS': 10,     # K-Fold 교차 검증 시 데이터를 나눌 폴드(Fold)의 수
-    'N_TRIALS': 50,     # Optuna가 하이퍼파라미터 최적화를 위해 시도할 횟수 (시간 관계상 축소)
-    'CHEMBERTA_MODEL': 'seyonec/ChemBERTa-zinc-base-v1' # 사용할 사전 훈련 모델
+    'NBITS': 2048,      # Morgan 지문의 비트 수
+    'SEED': 42,         # 재현성을 위한 랜덤 시드
+    'N_SPLITS': 5,      # K-폴드 교차 검증에서 사용할 폴드 수
+    'N_TRIALS': 100     # Optuna 하이퍼파라미터 최적화 시도 횟수
 }
 
-# --- 함수 정의 ---
-
 def seed_everything(seed):
-    """
-    재현성을 위해 모든 종류의 랜덤 시드를 고정하는 함수.
-    이 함수를 호출하면 코드를 여러 번 실행해도 항상 동일한 결과를 얻을 수 있음.
-    """
-    random.seed(seed)  # 파이썬 내장 random 모듈의 시드 고정
-    os.environ['PYTHONHASHSEED'] = str(seed)  # 파이썬 해시 함수의 시드 고정
-    np.random.seed(seed)  # NumPy 라이브러리의 시드 고정
+    """모든 랜덤 시드를 설정하여 실험의 재현성을 보장하는 함수"""
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
 
-# Optuna 튜닝 및 초기 데이터 분할의 일관성을 위해 첫 번째 시드로 초기화
-seed_everything(CFG['SEEDS'][0])
+# 전역 시드 설정
+seed_everything(CFG['SEED'])
 
 def load_data():
-    """
-    대회에서 제공된 'train.csv'와 'test.csv' 데이터를 로드하는 함수
-    """
-    try:
-        data_dir = Path("./data")  # 데이터 파일이 있는 디렉토리 경로
-        train_df = pd.read_csv(data_dir / "train.csv") # 훈련 데이터 로드
-        test_df = pd.read_csv(data_dir / "test.csv")   # 테스트 데이터 로드
-        return train_df, test_df
-    except FileNotFoundError as e:
-        # 파일이 없을 경우 에러 메시지를 출력하고 프로그램을 안전하게 종료
-        print(f"오류: {e}. 'data' 디렉토리에 파일이 있는지 확인하세요.")
-        return None, None
-
-def get_chemberta_embeddings(smiles_list, model_name, batch_size=32):
-    """
-    SMILES 리스트로부터 사전 훈련된 ChemBERTa 모델을 사용하여 임베딩을 추출하는 함수.
-    """
-    print(f"'{model_name}' 모델을 사용하여 임베딩 추출 중...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model.eval()
-
-    all_embeddings = []
-    with torch.no_grad():
-        for i in range(0, len(smiles_list), batch_size):
-            batch_smiles = smiles_list[i:i+batch_size]
-            inputs = tokenizer(batch_smiles, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
-            outputs = model(**inputs)
-            # [CLS] 토큰의 임베딩을 사용 (분자 전체의 대표 벡터)
-            cls_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-            all_embeddings.extend(cls_embeddings)
-            if (i // batch_size) % 10 == 0:
-                print(f"  {i+len(batch_smiles)} / {len(smiles_list)} 처리 완료...")
-
-    print("임베딩 추출 완료.")
-    return np.array(all_embeddings)
+    """데이터를 로드하는 함수"""
+    data_dir = Path("data")
+    train_df = pd.read_csv(data_dir / "train.csv")
+    test_df = pd.read_csv(data_dir / "test.csv")
+    sample_submission = pd.read_csv(data_dir / "sample_submission.csv")
+    return train_df, test_df, sample_submission
 
 def smiles_to_fingerprint(smiles):
-    """
-    분자의 구조 정보(SMILES 문자열)를 숫자 벡터(Morgan Fingerprint)로 변환하는 함수.
-    모델이 학습할 수 있도록 텍스트 정보를 숫자 정보로 바꾸는 과정.
-    """
-    mol = Chem.MolFromSmiles(smiles)  # SMILES 문자열을 RDKit 분자 객체로 변환
+    """SMILES 문자열을 Morgan 지문으로 변환하는 함수"""
+    mol = Chem.MolFromSmiles(smiles)
     if mol is not None:
-        # Morgan Fingerprint 생성. 분자 내 각 원자 주변의 구조적 특징을 요약한 것.
-        fp = AllChem.GetMorganFingerprintAsBitVect(mol, CFG['FP_RADIUS'], nBits=CFG['NBITS'])
-        arr = np.zeros((1,))  # 결과를 담을 NumPy 배열 초기화
-        DataStructs.ConvertToNumpyArray(fp, arr)  # Fingerprint를 NumPy 배열로 변환
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=CFG['NBITS'])
+        arr = np.zeros((CFG['NBITS'],))
+        DataStructs.ConvertToNumpyArray(fp, arr)
         return arr
-    return None  # 분자 객체 생성 실패 시 None 반환
+    return None
 
 def calculate_rdkit_descriptors(smiles):
-    """
-    SMILES 문자열로부터 약 200여 개의 물리화학적 특성(분자 설명자)을 계산하는 함수.
-    예: 분자량(MolWt), 로그 P(MolLogP) 등.
-    """
+    """SMILES 문자열로부터 RDKit 분자 설명자들을 계산하는 함수"""
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        # 분자 객체 생성 실패 시, 모든 설명자 값을 NaN(Not a Number)으로 채운 배열 반환
         return np.full((len(Descriptors._descList),), np.nan)
-    # RDKit에서 제공하는 모든 설명자 함수를 호출하여 값을 계산
     descriptors = [desc_func(mol) for _, desc_func in Descriptors._descList]
     return np.array(descriptors)
 
 def get_score(y_true, y_pred):
-    """
-    대회 평가 산식에 따라 모델의 성능 점수를 계산하는 함수.
-    Score = 0.5 * (1 - min(A, 1)) + 0.5 * B
-    A = Normalized RMSE (정규화된 평균 제곱근 오차)
-    B = Pearson Correlation Coefficient (피어슨 상관 계수)
-    """
-    # --- A 계산: Normalized RMSE (NRMSE) ---
-    # 예측값과 실제값의 차이(오차)를 측정하는 지표. 작을수록 좋음.
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    # 실제값의 범위 (최대값 - 최소값)
-    y_true_range = np.max(y_true) - np.min(y_true)
-    # 분모가 0이 되는 극단적인 경우를 방지
-    if y_true_range == 0:
-        nrmse = 0 if rmse == 0 else np.inf
-    else:
-        # RMSE를 실제값의 범위로 나누어 스케일에 무관하게 만들어 줌
-        nrmse = rmse / y_true_range
-    A = nrmse
+    """평가 지표에 따른 스코어 계산 함수 (NRMSE와 상관계수 기반)"""
+    # NRMSE 계산
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    nrmse = rmse / (np.max(y_true) - np.min(y_true))
+    A = 1 - min(nrmse, 1)
     
-    # --- B 계산: Pearson Correlation Coefficient ---
-    # 예측값과 실제값 사이의 '선형 관계'의 강도를 측정. 1에 가까울수록 좋음.
-    # 즉, 예측값이 실제값의 변화 경향성(오르내림)을 얼마나 잘 따라가는지를 나타냄.
-    if np.std(y_true) < 1e-6 or np.std(y_pred) < 1e-6:
-        # 데이터의 모든 값이 거의 동일하여 분산이 0에 가까우면 상관계수 계산이 불가능
-        correlation = 0.0
-    else:
-        correlation, _ = pearsonr(y_true, y_pred)
-    # 평가 산식에 따라 상관계수 값을 0과 1 사이로 제한(clip)
-    B = np.clip(correlation, 0, 1)
-
-    # 최종 점수 계산 (두 지표를 0.5씩 가중 평균)
-    score = 0.5 * (1 - min(A, 1)) + 0.5 * B
+    # 피어슨 상관계수 계산
+    corr = np.corrcoef(y_true, y_pred)[0, 1]
+    B = np.clip(corr, 0, 1)  # 0과 1 사이로 클리핑
+    
+    # 최종 스코어 계산
+    score = 0.5 * A + 0.5 * B
     return score
 
-def lgbm_score_metric(y_true, y_pred):
-    """
-    LightGBM 모델 훈련 시, 조기 종료(Early Stopping) 기준으로 사용하기 위한 커스텀 평가지표 함수.
-    """
-    score = get_score(y_true, y_pred)
-    # LightGBM이 인식할 수 있는 형태로 반환: (평가지표 이름, 점수, 높은 점수가 좋은지 여부)
-    return 'custom_score', score, True # is_higher_better=True. True이므로 점수가 높아지는 방향으로 학습.
+def create_stratified_folds(y, n_splits=5):
+    """회귀 문제에서 stratified 폴드를 생성하는 함수"""
+    # 타겟을 구간으로 나누어 stratify 수행
+    bins = np.percentile(y, np.linspace(0, 100, 11))  # 10개 구간으로 나누기
+    y_binned = np.digitize(y, bins)
+    
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=CFG['SEED'])
+    return skf.split(np.zeros(len(y)), y_binned)
 
 def objective(trial, X, y):
-    """
-    Optuna 라이브러리가 하이퍼파라미터를 최적화하기 위해 호출하는 목적 함수.
-    이 함수의 반환값(score)을 최대화하는 방향으로 최적의 파라미터 조합을 탐색.
-    """
-    # Optuna가 탐색할 하이퍼파라미터들의 이름과 범위를 정의
+    """Optuna 하이퍼파라미터 최적화를 위한 목적 함수"""
     params = {
-        'objective': 'regression',          # 목표: 회귀(숫자 예측)
-        'metric': 'rmse',                   # 기본 평가지표 (실제로는 커스텀 지표로 덮어쓰므로 큰 의미 없음)
-        'verbose': -1,                      # 훈련 과정의 로그를 출력하지 않음
-        'n_jobs': -1,                       # 컴퓨터의 모든 CPU 코어를 사용하여 훈련 속도 향상
-        'seed': CFG['SEEDS'][0],            # 튜닝 과정의 재현성을 위해 시드를 고정
-        'boosting_type': 'gbdt',            # 전통적인 그래디언트 부스팅 결정 트리 방식 사용
-        'n_estimators': 2000,               # 앙상블할 트리의 최대 개수 (조기 종료로 최적 개수 자동 탐색)
-        
-        # --- Optuna가 값을 제안(suggest)하여 최적화할 하이퍼파라미터들 ---
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True), # 학습률. 너무 크면 최적점을 지나치고, 작으면 훈련이 느림.
-        'num_leaves': trial.suggest_int('num_leaves', 20, 100),                     # 하나의 트리가 가질 수 있는 최대 리프(터미널) 노드의 수. 모델의 복잡도와 관련.
-        'max_depth': trial.suggest_int('max_depth', 3, 10),                         # 트리의 최대 깊이. 과적합 제어.
-        'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 1.0),      # 각 트리를 훈련할 때 무작위로 선택할 특징(feature)의 비율.
-        'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 1.0),      # 각 트리를 훈련할 때 무작위로 선택할 데이터(row)의 비율.
-        'bagging_freq': trial.suggest_int('bagging_freq', 1, 7),                    # 몇 번의 이터레이션마다 Bagging을 수행할지 결정.
-        'min_child_samples': trial.suggest_int('min_child_samples', 5, 50),         # 리프 노드가 되기 위해 필요한 최소한의 데이터 샘플 수. 과적합 제어.
+        'objective': 'regression',
+        'metric': 'rmse',
+        'verbose': -1,
+        'n_jobs': -1,
+        'seed': CFG['SEED'],
+        'boosting_type': 'gbdt',
+        'n_estimators': 3000,
+        # 최적화할 하이퍼파라미터들
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+        'num_leaves': trial.suggest_int('num_leaves', 15, 150),
+        'max_depth': trial.suggest_int('max_depth', 3, 12),
+        'feature_fraction': trial.suggest_float('feature_fraction', 0.5, 1.0),
+        'bagging_fraction': trial.suggest_float('bagging_fraction', 0.5, 1.0),
+        'bagging_freq': trial.suggest_int('bagging_freq', 1, 7),
+        'min_child_samples': trial.suggest_int('min_child_samples', 5, 100),
+        'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
+        'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 10.0),
     }
 
-    # 교차 검증을 위한 데이터 분할기 설정 (Optuna 튜닝 시에는 고정된 시드 사용)
-    kf = KFold(n_splits=CFG['N_SPLITS'], shuffle=True, random_state=CFG['SEEDS'][0])
-    # Out-of-Fold (OOF) 예측값을 저장하기 위한 배열 초기화.
-    # OOF 예측: 각 데이터 포인트가 '검증용'으로 사용될 때의 예측값을 모은 것. 모델의 일반화 성능을 평가하는 좋은 척도.
+    # Stratified K-fold 교차 검증
+    fold_scores = []
     oof_preds = np.zeros(len(X))
-
-    # K-Fold 교차 검증 수행
-    for train_idx, val_idx in kf.split(X, y):
-        # 훈련 데이터와 검증 데이터 분할
-        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+    
+    for train_idx, val_idx in create_stratified_folds(y, CFG['N_SPLITS']):
+        X_train, X_val = X[train_idx], X[val_idx]
         y_train, y_val = y[train_idx], y[val_idx]
         
-        # 정의된 파라미터로 LightGBM 모델 생성
         model = lgb.LGBMRegressor(**params)
-        
-        # 모델 훈련
         model.fit(X_train, y_train, 
-                  eval_set=[(X_val, y_val)],           # 훈련 중 성능을 모니터링할 검증 데이터셋 지정
-                  eval_metric=lgbm_score_metric,      # 조기 종료의 기준으로 커스텀 평가 함수 사용
-                  callbacks=[lgb.early_stopping(100, verbose=False)]) # 100번의 이터레이션 동안 검증 점수가 향상되지 않으면 훈련을 조기 종료
+                  eval_set=[(X_val, y_val)],
+                  eval_metric='rmse', 
+                  callbacks=[lgb.early_stopping(200, verbose=False)])
         
-        # 검증 데이터에 대한 예측 및 결과 저장
-        # Inhibition 값은 0~100 사이의 퍼센트 값이므로, 예측값도 해당 범위로 클리핑하여 안정성 확보
-        oof_preds[val_idx] = np.clip(model.predict(X_val), 0, 100)
+        val_pred = model.predict(X_val)
+        oof_preds[val_idx] = val_pred
+        
+        # 각 폴드의 스코어 계산
+        fold_score = get_score(y_val, val_pred)
+        fold_scores.append(fold_score)
+    
+    # 전체 OOF 스코어 계산
+    oof_score = get_score(y, oof_preds)
+    return oof_score
 
-    # 모든 폴드의 OOF 예측값을 사용하여 최종 성능 점수 계산
-    score = get_score(y, oof_preds)
-    return score
+def main():
+    print("=== CYP3A4 효소 저해율 예측 모델 ===")
+    print("1. 데이터 로딩 및 전처리...")
+    
+    # 데이터 로드
+    train_df, test_df, sample_submission = load_data()
+    print(f"Train 데이터: {len(train_df)}개")
+    print(f"Test 데이터: {len(test_df)}개")
+    print(f"Inhibition 평균: {train_df['Inhibition'].mean():.2f}%")
+    print(f"Inhibition 범위: {train_df['Inhibition'].min():.2f}% ~ {train_df['Inhibition'].max():.2f}%")
+    print(f"0값 개수: {sum(train_df['Inhibition'] == 0)}개 (전체의 {sum(train_df['Inhibition'] == 0)/len(train_df)*100:.1f}%)")
+    
+    print("\n2. 분자 특성 추출...")
+    
+    # 훈련 데이터 특성 추출
+    print("훈련 데이터 Morgan 지문 계산 중...")
+    train_df['fingerprint'] = train_df['Canonical_Smiles'].apply(smiles_to_fingerprint)
+    print("훈련 데이터 RDKit 설명자 계산 중...")
+    train_df['descriptors'] = train_df['Canonical_Smiles'].apply(calculate_rdkit_descriptors)
+    
+    # 테스트 데이터 특성 추출
+    print("테스트 데이터 Morgan 지문 계산 중...")
+    test_df['fingerprint'] = test_df['Canonical_Smiles'].apply(smiles_to_fingerprint)
+    print("테스트 데이터 RDKit 설명자 계산 중...")
+    test_df['descriptors'] = test_df['Canonical_Smiles'].apply(calculate_rdkit_descriptors)
+    
+    # 유효한 데이터만 필터링
+    train_valid = train_df.dropna(subset=['fingerprint', 'descriptors'])
+    test_valid_mask = test_df['fingerprint'].notna() & test_df['descriptors'].notna()
+    test_valid = test_df[test_valid_mask].copy()
+    
+    print(f"유효한 훈련 데이터: {len(train_valid)}개 (전체의 {len(train_valid)/len(train_df)*100:.1f}%)")
+    print(f"유효한 테스트 데이터: {sum(test_valid_mask)}개 (전체의 {sum(test_valid_mask)/len(test_df)*100:.1f}%)")
+    
+    # 설명자 데이터 처리
+    desc_train = np.stack(train_valid['descriptors'].values)
+    desc_test = np.stack(test_valid['descriptors'].values)
+    
+    # NaN 값을 평균으로 대체
+    desc_mean = np.nanmean(desc_train, axis=0)
+    desc_train = np.nan_to_num(desc_train, nan=desc_mean)
+    desc_test = np.nan_to_num(desc_test, nan=desc_mean)
+    
+    # 설명자 정규화
+    scaler = StandardScaler()
+    desc_train_scaled = scaler.fit_transform(desc_train)
+    desc_test_scaled = scaler.transform(desc_test)
+    
+    # 지문과 설명자 결합
+    fp_train = np.stack(train_valid['fingerprint'].values)
+    fp_test = np.stack(test_valid['fingerprint'].values)
+    
+    X_train = np.hstack([fp_train, desc_train_scaled])
+    X_test = np.hstack([fp_test, desc_test_scaled])
+    y_train = train_valid['Inhibition'].values
+    
+    print(f"최종 특성 차원: {X_train.shape[1]}개")
+    
+    print("\n3. 하이퍼파라미터 최적화...")
+    study = optuna.create_study(direction='maximize', study_name='cyp3a4_inhibition')
+    study.optimize(lambda trial: objective(trial, X_train, y_train), n_trials=CFG['N_TRIALS'])
+    
+    print(f"최적화 완료. 최고 스코어: {study.best_value:.4f}")
+    print("최적 파라미터:", study.best_params)
+    
+    print("\n4. 최종 모델 훈련 및 예측...")
+    
+    # 최적 파라미터로 모델 설정
+    best_params = {
+        'objective': 'regression',
+        'metric': 'rmse',
+        'verbose': -1,
+        'n_jobs': -1,
+        'seed': CFG['SEED'],
+        'boosting_type': 'gbdt',
+        'n_estimators': 3000
+    }
+    best_params.update(study.best_params)
+    
+    # 앙상블 예측
+    test_preds = np.zeros(len(X_test))
+    oof_preds = np.zeros(len(X_train))
+    feature_importance = np.zeros(X_train.shape[1])
+    
+    for fold, (train_idx, val_idx) in enumerate(create_stratified_folds(y_train, CFG['N_SPLITS'])):
+        print(f"폴드 {fold+1}/{CFG['N_SPLITS']} 훈련 중...")
+        
+        X_fold_train, X_fold_val = X_train[train_idx], X_train[val_idx]
+        y_fold_train, y_fold_val = y_train[train_idx], y_train[val_idx]
+        
+        model = lgb.LGBMRegressor(**best_params)
+        model.fit(X_fold_train, y_fold_train,
+                  eval_set=[(X_fold_val, y_fold_val)],
+                  eval_metric='rmse',
+                  callbacks=[lgb.early_stopping(200, verbose=False)])
+        
+        # OOF 예측
+        oof_preds[val_idx] = model.predict(X_fold_val)
+        
+        # 테스트 예측
+        test_preds += model.predict(X_test) / CFG['N_SPLITS']
+        
+        # 특성 중요도 누적
+        feature_importance += model.feature_importances_ / CFG['N_SPLITS']
+        
+        # 폴드 스코어 출력
+        fold_score = get_score(y_fold_val, oof_preds[val_idx])
+        print(f"폴드 {fold+1} 스코어: {fold_score:.4f}")
+    
+    # 최종 OOF 스코어
+    final_oof_score = get_score(y_train, oof_preds)
+    print(f"\n최종 OOF 스코어: {final_oof_score:.4f}")
+    
+    print("\n5. 제출 파일 생성...")
+    
+    # 제출 파일 생성
+    submission = sample_submission.copy()
+    
+    # 예측 결과를 데이터프레임으로 만들기
+    pred_df = pd.DataFrame({
+        'ID': test_valid['ID'].values,
+        'Inhibition': test_preds
+    })
+    
+    # 예측값을 0 이상으로 클리핑
+    pred_df['Inhibition'] = np.clip(pred_df['Inhibition'], 0, None)
+    
+    # 제출 파일에 예측값 병합
+    submission = submission.merge(pred_df, on='ID', how='left', suffixes=('', '_pred'))
+    submission['Inhibition'] = submission['Inhibition_pred'].fillna(train_df['Inhibition'].mean())
+    submission = submission[['ID', 'Inhibition']]
+    
+    # 제출 파일 저장
+    submission.to_csv('submission.csv', index=False)
+    print("제출 파일 'submission.csv' 생성 완료!")
+    
+    # 예측 통계
+    print(f"\n=== 예측 결과 통계 ===")
+    print(f"전체 예측 수: {len(submission)}개")
+    print(f"유효한 예측 수: {len(pred_df)}개")
+    print(f"예측값 범위: {submission['Inhibition'].min():.2f}% ~ {submission['Inhibition'].max():.2f}%")
+    print(f"예측값 평균: {submission['Inhibition'].mean():.2f}%")
+    print(f"예측값 중앙값: {submission['Inhibition'].median():.2f}%")
+    
+    # 특성 중요도 상위 10개
+    print(f"\n=== 상위 특성 중요도 ===")
+    top_features = np.argsort(feature_importance)[-10:][::-1]
+    for i, feat_idx in enumerate(top_features):
+        if feat_idx < CFG['NBITS']:
+            feat_name = f"Morgan_bit_{feat_idx}"
+        else:
+            desc_idx = feat_idx - CFG['NBITS']
+            feat_name = f"Descriptor_{desc_idx}"
+        print(f"{i+1:2d}. {feat_name}: {feature_importance[feat_idx]:.1f}")
 
-# --- 메인 실행 블록 ---
-# 이 스크립트가 직접 실행될 때만 아래 코드가 동작하도록 함
 if __name__ == "__main__":
-    # === 1. 데이터 로딩 ===
-    print("1. 데이터 로딩...")
-    train_df, test_df = load_data()
-
-    if train_df is not None and test_df is not None:
-        # === 2. 특징 공학 (Feature Engineering) ===
-        # 분자 구조(SMILES)로부터 모델이 학습할 수 있는 유의미한 숫자 형태의 특징들을 추출하고 가공하는 과정
-        print("\n2. 특징 공학(Feature Engineering)...")
-        
-        # --- 2a. ChemBERTa 임베딩 추출 ---
-        train_embeddings = get_chemberta_embeddings(train_df['Canonical_Smiles'].tolist(), CFG['CHEMBERTA_MODEL'])
-        embedding_feature_names = [f"emb_{i}" for i in range(train_embeddings.shape[1])]
-        embedding_df = pd.DataFrame(train_embeddings, columns=embedding_feature_names, index=train_df.index)
-
-        # --- 2b. RDKit 분자 설명자 특징 추출 ---
-        train_df['descriptors'] = train_df['Canonical_Smiles'].apply(calculate_rdkit_descriptors)
-        
-        # 임베딩과 설명자 특징 결합
-        train_df = pd.concat([train_df, embedding_df], axis=1)
-        train_df.dropna(subset=['descriptors'], inplace=True) # 설명자 계산 실패한 경우 제외
-
-        # 특징들을 수평으로 결합하기 위해 NumPy 배열 형태로 변환
-        desc_stack = np.stack(train_df['descriptors'].values)
-        
-        # 분자 설명자의 결측값(NaN) 처리
-        # RDKit이 특정 분자에 대해 설명자를 계산하지 못하는 경우 발생.
-        # 훈련 데이터 전체의 각 설명자별 평균값으로 이 결측값을 대체.
-        desc_mean = np.nanmean(desc_stack, axis=0)
-        desc_stack = np.nan_to_num(desc_stack, nan=desc_mean)
-
-        # 분자 설명자 정규화 (Standard Scaling)
-        # 각 특징(열)의 평균을 0, 표준편차를 1로 만들어줌.
-        # 스케일이 다른 특징들이 모델 학습에 미치는 영향을 균등하게 만들어 성능 향상에 도움.
-        scaler = StandardScaler()
-        desc_scaled = scaler.fit_transform(desc_stack)
-        
-        # === 최종 훈련 데이터셋(X, y) 생성 ===
-        # ChemBERTa 임베딩과 정규화된 분자 설명자를 수평으로 결합하여 최종 특징 행렬(X) 생성
-        embedding_features = train_df[embedding_feature_names].values
-        X = np.hstack([embedding_features, desc_scaled])
-        # 예측해야 할 목표 변수(y)를 'Inhibition' 컬럼으로 지정
-        y = train_df['Inhibition'].values
-
-        # 특징 이름 생성 (LightGBM 실행 시 발생하는 경고 메시지를 방지하고, 나중에 특징 중요도 분석을 용이하게 함)
-        desc_feature_names = [name for name, _ in Descriptors._descList]
-        all_feature_names = embedding_feature_names + desc_feature_names
-        # 숫자만 있던 NumPy 배열을 특징 이름이 있는 Pandas DataFrame으로 변환
-        X = pd.DataFrame(X, columns=all_feature_names)
-
-        # === 3. 하이퍼파라미터 최적화 (Optuna) ===
-        print("\n3. Optuna를 사용한 하이퍼파라미터 최적화...")
-        # Optuna 스터디 객체 생성 (목표: objective 함수의 점수를 '최대화(maximize)')
-        study = optuna.create_study(direction='maximize', study_name='lgbm_inhibition_tuning')
-        # 정의된 횟수(N_TRIALS)만큼 최적화 수행
-        study.optimize(lambda trial: objective(trial, X, y), n_trials=CFG['N_TRIALS'])
-
-        print(f"\n최적화 완료. 최고 점수: {study.best_value:.4f}")
-        print("최적 파라미터:", study.best_params)
-
-        # Optuna가 찾은 최적의 하이퍼파라미터를 기본 모델 파라미터에 업데이트
-        best_params = {
-            'objective': 'regression', 
-            'metric': 'rmse', 
-            'verbose': -1, 
-            'n_jobs': -1,
-            'boosting_type': 'gbdt', 
-            'n_estimators': 2000
-        }
-        best_params.update(study.best_params)
-
-        # === 4. 최종 모델 훈련 및 예측 (시드 앙상블) ===
-        print("\n4. 시드 앙상블을 사용한 최종 모델 훈련 및 예측...")
-        
-        # --- 테스트 데이터에 대해서도 훈련 데이터와 '동일한' 특징 공학 과정 수행 ---
-        # --- 4a. ChemBERTa 임베딩 추출 ---
-        test_embeddings = get_chemberta_embeddings(test_df['Canonical_Smiles'].tolist(), CFG['CHEMBERTA_MODEL'])
-        test_embedding_df = pd.DataFrame(test_embeddings, columns=embedding_feature_names, index=test_df.index)
-
-        # --- 4b. RDKit 분자 설명자 특징 추출 ---
-        test_df['descriptors'] = test_df['Canonical_Smiles'].apply(calculate_rdkit_descriptors)
-        
-        # 임베딩과 설명자 특징 결합
-        test_df = pd.concat([test_df, test_embedding_df], axis=1)
-
-        # 특징 추출에 성공한 유효한 테스트 데이터만 선택 (임베딩은 항상 성공한다고 가정)
-        valid_test_mask = test_df['descriptors'].notna()
-        
-        # 특징들을 NumPy 배열로 변환
-        embedding_test_features = test_df.loc[valid_test_mask, embedding_feature_names].values
-        desc_test_stack = np.stack(test_df.loc[valid_test_mask, 'descriptors'].values)
-        
-        # 결측값 처리 (중요: 테스트 데이터의 평균이 아닌, '훈련 데이터'에서 계산한 평균(desc_mean)으로 채워야 함)
-        desc_test_stack = np.nan_to_num(desc_test_stack, nan=desc_mean)
-        # 정규화 (중요: 테스트 데이터로 새로 학습하는 것이 아닌, '훈련 데이터'로 학습된 스케일러(scaler)를 그대로 사용)
-        desc_test_scaled = scaler.transform(desc_test_stack)
-        
-        # 최종 테스트 데이터셋(X_test) 생성
-        X_test = np.hstack([embedding_test_features, desc_test_scaled])
-        X_test = pd.DataFrame(X_test, columns=all_feature_names)
-
-        # 시드 앙상블의 전체 예측값을 저장할 배열 초기화
-        ensembled_test_preds = np.zeros(len(X_test))
-        
-        # 설정된 시드 목록을 하나씩 순회하며 훈련 및 예측 반복
-        for seed in CFG['SEEDS']:
-            print(f"--- 훈련 시작 (시드: {seed}) ---")
-            seed_everything(seed)             # 현재 시드로 모든 랜덤 상태 고정
-            best_params['seed'] = seed        # 모델 파라미터에도 현재 시드 설정
-            
-            # K-Fold 분할기 (현재 시드로 초기화하여 매번 다른 방식으로 데이터를 분할)
-            kf = KFold(n_splits=CFG['N_SPLITS'], shuffle=True, random_state=seed)
-            # 현재 시드에서의 예측값을 저장할 배열 초기화 (폴드별 예측을 평균내기 위함)
-            seed_test_preds = np.zeros(len(X_test))
-
-            # 교차 검증 루프 (주의: 여기서는 검증 데이터를 사용하지 않고, 각 폴드를 전체 데이터로 사용하여 훈련)
-            # 이는 최종 예측 시, 가능한 한 많은 데이터로 훈련된 모델을 만들기 위함. K-Fold는 데이터 분할 방식의 다양성을 위해 사용.
-            for fold, (train_idx, _) in enumerate(kf.split(X, y)):
-                print(f"--- 폴드 {fold+1}/{CFG['N_SPLITS']} (시드: {seed}) ---")
-                X_train, y_train = X.iloc[train_idx], y[train_idx]
-                
-                # 최적의 하이퍼파라미터로 모델 생성
-                model = lgb.LGBMRegressor(**best_params)
-                # 현재 폴드의 훈련 데이터로 모델 훈련
-                model.fit(X_train, y_train)
-                # 테스트 데이터에 대한 예측을 수행하고, 폴드 수로 나누어 누적 (평균 계산)
-                seed_test_preds += model.predict(X_test) / CFG['N_SPLITS']
-            
-            # 현재 시드의 예측 결과를 전체 앙상블 예측값에 더함
-            ensembled_test_preds += seed_test_preds
-            
-        # 모든 시드의 예측값을 합한 결과를 시드의 개수로 나누어 최종 평균 예측값 계산
-        final_preds = ensembled_test_preds / len(CFG['SEEDS'])
-        # 안정성을 위해 최종 예측값도 0~100 사이로 클리핑
-        final_preds = np.clip(final_preds, 0, 100)
-
-        # === 5. 제출 파일 생성 ===
-        print("\n5. 제출 파일 생성...")
-        data_dir = Path("./data")
-        sample_submission = pd.read_csv(data_dir / "sample_submission.csv")
-        
-        # 예측 결과를 'ID'와 'Inhibition' 컬럼을 가진 데이터프레임으로 변환
-        pred_df = pd.DataFrame({'ID': test_df.loc[valid_test_mask, 'ID'], 'Inhibition': final_preds})
-        
-        # 대회 제출 양식(sample_submission)에 나의 예측값을 ID 기준으로 병합
-        submission_df = sample_submission[['ID']].merge(pred_df, on='ID', how='left')
-        # 특징 추출 실패 등으로 예측하지 못한 값이 있다면, 훈련 데이터의 전체 평균값으로 채움
-        submission_df['Inhibition'] = submission_df['Inhibition'].fillna(train_df['Inhibition'].mean())
-        
-        # 최종 제출 파일을 'submission.csv'로 저장 (인덱스는 제외)
-        submission_path = Path("submission.csv")
-        submission_df.to_csv(submission_path, index=False)
-        print(f"제출 파일 저장 완료: {submission_path}")
-        
-        # --- 예측 결과 통계 출력 ---
-        print(f"\n--- 예측 결과 통계 ---")
-        print(f"총 예측 수: {len(submission_df)}")
-        print(f"유효한 예측 수: {len(pred_df)}")
-        print(f"Inhibition 범위: {submission_df['Inhibition'].min():.2f}% ~ {submission_df['Inhibition'].max():.2f}%")
-        print(f"평균 Inhibition: {submission_df['Inhibition'].mean():.2f}%")
-        print(f"중앙값 Inhibition: {submission_df['Inhibition'].median():.2f}%")
-
-        # === 6. 예상 스코어 계산 및 출력 ===
-        print("\n=== 6. 예상 스코어 계산 (test.csv를 실제 리더보드 데이터로 가정) ===")
-        
-        # test.csv에 실제 정답값이 있다고 가정하고 스코어 계산
-        # 실제로는 test.csv에 'Inhibition' 컬럼이 없으므로, 
-        # 훈련 데이터의 분포를 기반으로 시뮬레이션하거나
-        # 또는 실제 정답값이 있다고 가정하고 계산
-        
-        try:
-            # 방법 1: test.csv에 실제 정답값이 있다고 가정
-            if 'Inhibition' in test_df.columns:
-                # 실제 정답값이 있는 경우
-                y_test_true = test_df.loc[valid_test_mask, 'Inhibition'].values
-                expected_score = get_score(y_test_true, final_preds)
-                print(f" 예상 스코어 (실제 정답 기반): {expected_score:.4f}")
-                
-                # 목표 점수와 비교
-                target_score = 0.85
-                if expected_score >= target_score:
-                    print(f"✅ 목표 점수 {target_score} 달성! (차이: +{expected_score - target_score:.4f})")
-                else:
-                    print(f"❌ 목표 점수 {target_score} 미달성 (차이: {expected_score - target_score:.4f})")
-                    
-            else:
-                # 방법 2: 훈련 데이터 기반으로 예상 스코어 시뮬레이션
-                print("📊 test.csv에 정답값이 없으므로 훈련 데이터 기반으로 예상 스코어를 계산합니다...")
-                
-                # 훈련 데이터에서 교차 검증 스코어 계산
-                print("\n--- 교차 검증 스코어 계산 ---")
-                cv_scores = []
-                
-                # 시드 앙상블의 각 시드별로 교차 검증 스코어 계산
-                for seed in CFG['SEEDS']:
-                    print(f"\n--- 시드 {seed} 교차 검증 ---")
-                    seed_everything(seed)
-                    best_params['seed'] = seed
-                    
-                    kf = KFold(n_splits=CFG['N_SPLITS'], shuffle=True, random_state=seed)
-                    oof_preds = np.zeros(len(X))
-                    
-                    for fold, (train_idx, val_idx) in enumerate(kf.split(X, y)):
-                        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
-                        y_train, y_val = y[train_idx], y[val_idx]
-                        
-                        model = lgb.LGBMRegressor(**best_params)
-                        model.fit(X_train, y_train, 
-                                eval_set=[(X_val, y_val)],
-                                eval_metric=lgbm_score_metric,
-                                callbacks=[lgb.early_stopping(100, verbose=False)])
-                        
-                        oof_preds[val_idx] = np.clip(model.predict(X_val), 0, 100)
-                    
-                    # 현재 시드의 교차 검증 스코어 계산
-                    cv_score = get_score(y, oof_preds)
-                    cv_scores.append(cv_score)
-                    print(f"시드 {seed} CV 스코어: {cv_score:.4f}")
-                
-                # 전체 시드의 평균 교차 검증 스코어
-                mean_cv_score = np.mean(cv_scores)
-                std_cv_score = np.std(cv_scores)
-                
-                print(f"\n📈 교차 검증 결과:")
-                print(f"평균 CV 스코어: {mean_cv_score:.4f} ± {std_cv_score:.4f}")
-                print(f"최고 CV 스코어: {np.max(cv_scores):.4f}")
-                print(f"최저 CV 스코어: {np.min(cv_scores):.4f}")
-                
-                # 목표 점수와 비교
-                target_score = 0.85
-                if mean_cv_score >= target_score:
-                    print(f"✅ 목표 점수 {target_score} 달성 가능성 높음!")
-                    print(f"   (평균 CV 스코어: {mean_cv_score:.4f})")
-                else:
-                    print(f"⚠️  목표 점수 {target_score} 달성에 도전적")
-                    print(f"   (평균 CV 스코어: {mean_cv_score:.4f}, 차이: {mean_cv_score - target_score:.4f})")
-                
-                # 성능 개선 제안
-                print(f"\n💡 성능 개선 제안:")
-                if mean_cv_score < 0.80:
-                    print("   - 더 많은 사전 훈련 모델 앙상블 고려")
-                    print("   - 추가적인 분자 설명자 활용")
-                    print("   - 하이퍼파라미터 탐색 범위 확대")
-                elif mean_cv_score < 0.85:
-                    print("   - 시드 앙상블 수 증가")
-                    print("   - 더 정교한 하이퍼파라미터 튜닝")
-                    print("   - 특징 선택 기법 적용")
-                else:
-                    print("   - 현재 모델이 목표 성능을 충족합니다!")
-                
-                # 예상 리더보드 스코어 (교차 검증 스코어에 약간의 보수적 조정)
-                expected_leaderboard_score = mean_cv_score - 0.02  # 보수적 추정
-                print(f"\n🎯 예상 리더보드 스코어: {expected_leaderboard_score:.4f}")
-                print(f"   (CV 스코어에서 0.02를 뺀 보수적 추정)")
-                
-        except Exception as e:
-            print(f"스코어 계산 중 오류 발생: {e}")
-            print("기본 통계 정보만 출력합니다.")
-        
-        print(f"\n{'='*60}")
-        print("🎉 모델 훈련 및 예측 완료!")
-        print(f"{'='*60}")
-        
-    else:
-        print("데이터 로드 실패. 파일 경로를 확인하세요.")
+    main()
